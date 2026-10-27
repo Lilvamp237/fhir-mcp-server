@@ -36,6 +36,7 @@ logging.basicConfig(
 logger: logging.Logger = logging.getLogger(__name__)
 
 LIVE_FHIR_BASE_URL = "https://hapi.fhir.org/baseR4"
+STARTUP_TIMEOUT_SECONDS = 30
 
 
 class RecordingFhirServer:
@@ -131,15 +132,12 @@ async def run_mcp_server(fhir_base_url: str) -> AsyncGenerator[bool, Any]:
     t = threading.Thread(target=stream_output, daemon=True)
     t.start()
 
-    # Wait for the server to be ready (port 8001 open)
+    # Wait for the server to be ready (port 8001 open). `uv run` may rebuild
+    # the project first, so allow well over the server's own start-up time.
     start = time.time()
     ready = False
-    while time.time() - start < 5:  # wait up to 5 seconds
+    while time.time() - start < STARTUP_TIMEOUT_SECONDS:
         if process.poll() is not None:
-            # Print any remaining output
-            if process.stdout is not None:
-                for line in process.stdout:
-                    logger.debug(f"{line.rstrip()}")
             raise RuntimeError("MCP server process exited before port 8001 was open.")
         try:
             with socket.create_connection(("localhost", 8001), timeout=1):
@@ -149,9 +147,8 @@ async def run_mcp_server(fhir_base_url: str) -> AsyncGenerator[bool, Any]:
             logger.debug("Waiting until MCP server starts: %s", ex)
             time.sleep(0.5)
     if not ready:
-        if process.stdout is not None:
-            for line in process.stdout:
-                logger.debug(f"{line.rstrip()}")
+        # Stop the server before giving up; its output is already streamed by
+        # the reader thread, and reading stdout here would block until it exits.
         terminate_process_tree(process)
         raise RuntimeError(f"MCP server failed to start or port 8001 not open.")
     logger.info("MCP server is ready on port 8001.")

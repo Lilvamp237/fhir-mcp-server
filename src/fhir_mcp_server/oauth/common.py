@@ -23,8 +23,6 @@ import hashlib
 import base64
 
 from typing import Dict
-from httpx import Response
-
 
 from fhir_mcp_server.oauth.types import OAuthMetadata, OAuthToken
 from mcp.shared._httpx_utils import create_mcp_http_client
@@ -116,7 +114,7 @@ async def perform_token_flow(
 ) -> OAuthToken:
     try:
         async with create_mcp_http_client() as client:
-            response: Response = await client.post(
+            response = await client.post(
                 url=url,
                 data=data,
                 headers=headers,

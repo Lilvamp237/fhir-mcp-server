@@ -17,7 +17,6 @@
 import click
 import logging
 
-from importlib.metadata import version as package_version
 
 from fhir_mcp_server.field_filter import filter_response_fields
 from fhir_mcp_server.utils import (
@@ -51,9 +50,15 @@ from starlette.responses import RedirectResponse, Response
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
-from mcp.server.fastmcp.server import FastMCP
+from mcp.server.mcpserver import MCPServer
+from importlib.metadata import PackageNotFoundError, version
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+try:
+    SERVER_VERSION: str = version("fhir-mcp-server")
+except PackageNotFoundError:
+    SERVER_VERSION = "0.0.0"
 
 configs: ServerConfigs = ServerConfigs()
 
@@ -112,19 +117,17 @@ async def get_async_fhir_client() -> AsyncFHIRClient:
     return await create_async_fhir_client(**client_kwargs)
 
 
-def configure_mcp_server() -> FastMCP:
+def configure_mcp_server() -> MCPServer:
     """
-    Configure and instantiate the FastMCP server instance.
+    Configure and instantiate the MCPServer instance.
     If disable_auth is True, the server will be started without authorization.
-    Returns a FastMCP instance.
+    Transport options are applied when the server is run; see `http_transport_options`.
+    Returns an MCPServer instance.
     """
-    fastmcp_kwargs: Dict = {
+    mcp_kwargs: Dict = {
         "name": "FHIR MCP Server",
+        "version": SERVER_VERSION,
         "instructions": "This server implements the HL7 FHIR MCP for secure, standards-based access to FHIR resources",
-        "host": configs.mcp_host,
-        "port": configs.mcp_port,
-        "json_response": True,
-        "stateless_http": True,
     }
     disable_auth = configs.server_disable_authorization
     if not disable_auth:
@@ -132,29 +135,36 @@ def configure_mcp_server() -> FastMCP:
         auth_settings: AuthSettings = AuthSettings(
             issuer_url=AnyHttpUrl(configs.effective_server_url),
             resource_server_url=AnyHttpUrl(configs.effective_server_url),
+            # MCP tokens issued by the embedded provider carry no RFC 8707 resource yet.
+            validate_token_resource=False,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
                 valid_scopes=configs.scopes,
                 default_scopes=configs.scopes,
             ),
         )
-        fastmcp_kwargs["auth_server_provider"] = server_provider
-        fastmcp_kwargs["auth"] = auth_settings
+        mcp_kwargs["auth_server_provider"] = server_provider
+        mcp_kwargs["auth"] = auth_settings
     else:
         logger.warning("MCP authentication is disabled.")
-    mcp: FastMCP = FastMCP(**fastmcp_kwargs)
-    # FastMCP does not accept a version, so the low-level server would otherwise
-    # report the MCP SDK version in serverInfo.
-    mcp._mcp_server.version = package_version("fhir-mcp-server")
-    return mcp
+    return MCPServer(**mcp_kwargs)
+
+
+def http_transport_options(transport: str) -> Dict[str, Any]:
+    """Options for `MCPServer.run()` and `streamable_http_app()` on HTTP transports."""
+    options: Dict[str, Any] = {"host": configs.mcp_host}
+    if transport == "streamable-http":
+        options["json_response"] = True
+        options["stateless_http"] = True
+    return options
 
 
 def register_mcp_routes(
-    mcp: FastMCP,
+    mcp: MCPServer,
     server_provider: OAuthServerProvider,
 ) -> None:
     """
-    Register custom routes for the FastMCP server instance.
+    Register custom routes for the MCPServer instance.
     """
     logger.debug("Registering custom MCP routes.")
 
@@ -180,9 +190,9 @@ def register_mcp_routes(
             return handle_failed_authentication("Something went wrong.")
 
 
-def register_mcp_tools(mcp: FastMCP) -> None:
+def register_mcp_tools(mcp: MCPServer) -> None:
     """
-    Register tool functions for the FastMCP server instance.
+    Register tool functions for the MCPServer instance.
     """
     logger.debug("Registering MCP tools.")
 
@@ -876,11 +886,18 @@ def main(transport, log_level) -> int:
         format="[%(asctime)s] %(levelname)s {%(name)s.%(funcName)s:%(lineno)d} - %(message)s",
     )
     try:
-        mcp: FastMCP = configure_mcp_server()
+        mcp: MCPServer = configure_mcp_server()
         register_mcp_tools(mcp=mcp)
         register_mcp_routes(mcp=mcp, server_provider=server_provider)
         logger.info(f"Starting FHIR MCP server with {transport} transport")
-        mcp.run(transport=transport)
+        if transport == "stdio":
+            mcp.run(transport=transport)
+        else:
+            mcp.run(
+                transport=transport,
+                port=configs.mcp_port,
+                **http_transport_options(transport),
+            )
     except Exception as ex:
         logger.error(
             "Unable to run the FHIR MCP server. Caused by, %s", ex, exc_info=True

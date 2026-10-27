@@ -7,27 +7,29 @@ antlr4-python3-runtime==4.13.2
 anyio==4.15.1
 attrs==26.1.0
 certifi==2026.10.19
-cffi==2.1.1
+cffi==2.1.1 ; platform_python_implementation != 'PyPy'
 charset-normalizer==3.5.2
 click==8.5.0
-colorama==0.4.6
+colorama==0.4.6 ; sys_platform == 'win32'
 cryptography==50.0.2
 fhirpathpy==2.2.0
 fhirpy==2.2.0
 frozenlist==1.8.0
-h11==0.16.0
-httpcore==1.0.9
-httpx==0.28.1
-httpx-sse==0.4.3
+h11==0.16.0 ; sys_platform != 'emscripten'
+httpcore2==2.16.0 ; sys_platform != 'emscripten'
+httpx2==2.16.0
+httpx2-jsfetch==1.0 ; sys_platform == 'emscripten'
 idna==3.20
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 markdown-it-py==4.2.0
-mcp==1.27.1
+mcp==2.3.0
+mcp-types==2.3.0
 mdurl==0.1.2
 multidict==6.9.1
+opentelemetry-api==1.45.1
 propcache==0.5.4
-pycparser==3.11
+pycparser==3.11 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
 pydantic==2.14.1
 pydantic-core==2.50.1
 pydantic-settings==2.15.0
@@ -37,7 +39,7 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.4
 python-multipart==0.0.32
 pytz==2026.5
-pywin32==312; sys_platform == "win32"
+pywin32==312 ; sys_platform == 'win32'
 referencing==0.37.0
 requests==2.34.2
 rich==15.0.0
@@ -46,9 +48,10 @@ shellingham==1.5.4
 six==1.17.0
 sse-starlette==3.5.0
 starlette==1.7.0
+truststore==0.10.5 ; sys_platform != 'emscripten'
 typer==0.27.3
 typing-extensions==4.16.0
 typing-inspection==0.4.4
 urllib3==2.8.0
-uvicorn==0.54.0
+uvicorn==0.54.0 ; sys_platform != 'emscripten'
 yarl==1.25.1
