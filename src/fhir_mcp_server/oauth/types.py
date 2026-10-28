@@ -18,11 +18,20 @@ import base64
 import json
 import logging
 
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 from pydantic import AnyHttpUrl, BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigurationError(ValueError):
+    """Raised at startup when the server's settings are invalid or outdated."""
+
+
+def _split(value: str) -> list[str]:
+    """Split a space- or comma-separated setting into its non-empty items."""
+    return [item for item in value.replace(",", " ").split() if item]
 
 
 class ServerConfigs(BaseSettings):
@@ -41,23 +50,34 @@ class ServerConfigs(BaseSettings):
     mcp_port: int = 8000
     mcp_server_url: str | None = None
     mcp_request_timeout: int = 30  # in secs
+    # Space- or comma-separated Host and Origin values accepted on HTTP transports.
+    # Empty keeps the SDK default (DNS-rebinding protection for localhost only).
+    mcp_allowed_hosts: str = ""
+    mcp_allowed_origins: str = ""
+    mcp_max_request_body_bytes: int | None = None
+
+    # MCP authorization: the MCP server is an OAuth resource server; the IdP issues tokens.
+    mcp_auth_mode: Literal["resource_server", "disabled"] = "resource_server"
+    mcp_idp_issuer: str = ""
+    mcp_idp_ca_cert: str | None = None  # CA bundle for an IdP with a self-signed certificate
+    mcp_resource_url: str | None = None  # canonical MCP endpoint URL and expected token audience
+    mcp_token_validation: Literal["jwks", "introspection"] = "jwks"
+    mcp_jwks_uri: str | None = None  # defaults to the IdP's discovered jwks_uri
+    mcp_introspection_client_id: str = ""
+    mcp_introspection_client_secret: str = ""
+    mcp_read_scope: str = "fhir-read"
+    mcp_write_scope: str = "fhir-write"
+    mcp_delete_scope: str = "fhir-delete"
 
     # FHIR settings
+    server_base_url: str = ""
+    server_auth_mode: Literal["none", "static_token"] | None = None
+    server_access_token: str | None = None
     server_client_id: str = ""
     server_client_secret: str = ""
     server_scopes: str = ""
-    server_base_url: str = ""
-    server_access_token: str | None = None
-    server_disable_authorization: bool = False
-
-    def callback_url(
-        self, server_url: str, suffix: str = "/oauth/callback"
-    ) -> AnyHttpUrl:
-        return AnyHttpUrl(f"{server_url.rstrip('/')}{suffix}")
-
-    @property
-    def discovery_url(self) -> str:
-        return f"{self.server_base_url.rstrip('/')}/.well-known/smart-configuration"
+    # Removed in favour of FHIR_MCP_AUTH_MODE and FHIR_SERVER_AUTH_MODE; rejected at startup.
+    server_disable_authorization: str | None = None
 
     @property
     def metadata_url(self) -> str:
@@ -65,18 +85,57 @@ class ServerConfigs(BaseSettings):
 
     @property
     def scopes(self) -> list[str]:
-        # If the raw value is a string, split on empty spaces
-        if isinstance(self.server_scopes, str):
-            return [
-                scope.strip()
-                for scope in self.server_scopes.split(" ")
-                if scope.strip()
-            ]
-        return [self.server_scopes]
+        return _split(self.server_scopes)
 
     @property
     def effective_server_url(self) -> str:
         return self.mcp_server_url or f"http://{self.mcp_host}:{self.mcp_port}"
+
+    @property
+    def effective_resource_url(self) -> str:
+        """The canonical URL of the MCP endpoint; tokens must be issued for it."""
+        return (self.mcp_resource_url or f"{self.effective_server_url.rstrip('/')}/mcp").rstrip("/")
+
+    @property
+    def effective_server_auth_mode(self) -> str:
+        if self.server_auth_mode:
+            return self.server_auth_mode
+        return "static_token" if self.server_access_token else "none"
+
+    @property
+    def allowed_hosts(self) -> list[str]:
+        return _split(self.mcp_allowed_hosts)
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        return _split(self.mcp_allowed_origins)
+
+    def validate_for_startup(self) -> None:
+        """Reject removed settings and incomplete configurations with a clear message."""
+        if self.server_disable_authorization is not None:
+            raise ConfigurationError(
+                "FHIR_SERVER_DISABLE_AUTHORIZATION is no longer supported. Use "
+                "FHIR_MCP_AUTH_MODE=disabled (MCP login) and FHIR_SERVER_AUTH_MODE "
+                "(how the server calls the FHIR server) instead."
+            )
+        if self.mcp_auth_mode == "resource_server":
+            if not self.mcp_idp_issuer:
+                raise ConfigurationError(
+                    "FHIR_MCP_IDP_ISSUER is required when FHIR_MCP_AUTH_MODE=resource_server. "
+                    "Set it to your identity provider's issuer URL, or set FHIR_MCP_AUTH_MODE=disabled "
+                    "for local development."
+                )
+            if self.mcp_token_validation == "introspection" and not (
+                self.mcp_introspection_client_id and self.mcp_introspection_client_secret
+            ):
+                raise ConfigurationError(
+                    "FHIR_MCP_INTROSPECTION_CLIENT_ID and FHIR_MCP_INTROSPECTION_CLIENT_SECRET are "
+                    "required when FHIR_MCP_TOKEN_VALIDATION=introspection."
+                )
+        if self.effective_server_auth_mode == "static_token" and not self.server_access_token:
+            raise ConfigurationError(
+                "FHIR_SERVER_ACCESS_TOKEN is required when FHIR_SERVER_AUTH_MODE=static_token."
+            )
 
     def __init__(self, **data):
         """Initialize settings with values from environment variables"""

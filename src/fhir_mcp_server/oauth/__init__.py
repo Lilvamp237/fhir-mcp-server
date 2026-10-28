@@ -14,13 +14,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from .common import handle_failed_authentication
-from .server_provider import OAuthServerProvider
 from .types import ServerConfigs, OAuthToken, IDToken, decode_jws
 
 __all__ = [
-    "handle_failed_authentication",
-    "OAuthServerProvider",
     "OAuthToken",
     "ServerConfigs",
     "IDToken",

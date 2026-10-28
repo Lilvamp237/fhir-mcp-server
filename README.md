@@ -30,6 +30,7 @@
   - [Configuration](#configuration)
     - [CLI Options](#cli-options)
     - [Environment Variables](#environment-variables)
+    - [Authorization](#authorization)
   - [Tools](#tools)
   - [Development \& Testing](#development--testing)
     - [Installing Development Dependencies](#installing-development-dependencies)
@@ -58,7 +59,7 @@ https://github.com/user-attachments/assets/96b433f1-3e53-4564-8466-65ab48d521de
 
 - **MCP-compatible transport**: Serves FHIR via stdio, SSE, or streamable HTTP
 
-- **SMART-on-FHIR based authentication support**: Securely authenticate with FHIR servers and clients
+- **IdP-based authorization (MCP 2026-07-28)**: Acts as an OAuth resource server. Clients sign in with your identity provider (for example ThunderID, WSO2 Identity Server or Keycloak), and every request's token is checked for issuer, audience and the scope each tool needs
 
 - **Response Filtering using FHIRPath**: Filter resources and bundles returned by `read` and `search` operations using custom FHIRPath expressions to retrieve only the fields needed for the task, reducing payload sizes.
 
@@ -80,8 +81,8 @@ You can use the FHIR MCP Server by installing our Python package, or by cloning 
     
     To run the server, you must set `FHIR_SERVER_BASE_URL`.
 
-    * **To enable authorization:** Set `FHIR_SERVER_BASE_URL`, `FHIR_SERVER_CLIENT_ID`, `FHIR_SERVER_CLIENT_SECRET`, and `FHIR_SERVER_SCOPES`. Authorization is enabled by default.
-    * **To disable authorization:** Set `FHIR_SERVER_DISABLE_AUTHORIZATION` to `True`.
+    * **Authorization (default):** Set `FHIR_MCP_IDP_ISSUER` to your identity provider's issuer URL. Clients sign in with the IdP, and the server validates their tokens. See [Authorization](#authorization).
+    * **Local development without sign-in:** Set `FHIR_MCP_AUTH_MODE` to `disabled`.
 
     By default, the MCP server runs on **[http://localhost:8000](http://localhost:8000)**, and you can customize the host and port using `FHIR_MCP_HOST` and `FHIR_MCP_PORT`.
 
@@ -90,9 +91,7 @@ You can use the FHIR MCP Server by installing our Python package, or by cloning 
 
     ```bash 
     export FHIR_SERVER_BASE_URL=""
-    export FHIR_SERVER_CLIENT_ID=""
-    export FHIR_SERVER_CLIENT_SECRET=""
-    export FHIR_SERVER_SCOPES=""
+    export FHIR_MCP_IDP_ISSUER=""
 
     export FHIR_MCP_HOST="localhost"
     export FHIR_MCP_PORT="8000"
@@ -142,7 +141,7 @@ You can use the FHIR MCP Server by installing our Python package, or by cloning 
 
 You can run the MCP server using Docker for a consistent, isolated environment. 
 
->Note on **Authorization**: When running the MCP server **locally** via Docker or Docker Compose, authorization should be disabled by setting the environment variable, `FHIR_SERVER_DISABLE_AUTHORIZATION=True` . This would be fixed in the future releases.
+>Note on **Authorization**: For a local Docker or Docker Compose run without an identity provider, set `FHIR_MCP_AUTH_MODE=disabled`. Otherwise set `FHIR_MCP_IDP_ISSUER` (see [Authorization](#authorization)); from inside a container, use an IdP address the container can reach, such as `host.docker.internal`.
 
 1. Build the Docker Image or pull the docker image from the container registry:
 
@@ -451,18 +450,46 @@ uv run fhir-mcp-server --help
 - `FHIR_MCP_SERVER_URL`: If set, this value will be used as the server's base URL instead of generating it from host and port. Useful for custom URL configurations or when behind a proxy.
 - `FHIR_MCP_REQUEST_TIMEOUT`: Timeout duration in seconds for requests from the MCP server to the FHIR server (default: `30`).
 
-**MCP Server OAuth2 with FHIR server Configuration (MCP Client ↔ MCP Server):**
-These variables configure the MCP client's secure connection to the MCP server, using the OAuth2 authorization code grant flow with a FHIR server.
+- `FHIR_MCP_ALLOWED_HOSTS` / `FHIR_MCP_ALLOWED_ORIGINS`: Space- or comma-separated `Host` and `Origin` header values to accept on HTTP transports. Set these when the server is reachable by a hostname other than `localhost`, so DNS-rebinding protection lets your clients through.
+- `FHIR_MCP_MAX_REQUEST_BODY_BYTES`: Largest request body accepted (SDK default: 4 MiB). Raise it if you create or update large FHIR resources.
 
-- `FHIR_SERVER_CLIENT_ID`: The OAuth2 client ID used to authorize MCP clients with the FHIR server.
-- `FHIR_SERVER_DISABLE_AUTHORIZATION`: If set to `True`, disables authorization checks on the MCP server, allowing connections to publicly accessible FHIR servers.
-- `FHIR_SERVER_CLIENT_SECRET`: The client secret corresponding to the FHIR client ID. Used during token exchange.
+**MCP Authorization (MCP Client ↔ MCP Server):**
+The MCP server is an OAuth 2.1 resource server. Tokens are issued by your identity provider (IdP); the server only validates them. See [Authorization](#authorization).
+
+- `FHIR_MCP_AUTH_MODE`: `resource_server` (default) or `disabled` (local development only; anyone who can reach the server can call every tool). The `stdio` transport never uses this flow.
+- `FHIR_MCP_IDP_ISSUER`: The IdP's issuer URL, exactly as it appears in its tokens' `iss` claim (e.g., `https://localhost:8090`). Required in `resource_server` mode.
+- `FHIR_MCP_IDP_CA_CERT`: Path to a CA certificate for an IdP with a self-signed TLS certificate (local development).
+- `FHIR_MCP_RESOURCE_URL`: The canonical URL of the MCP endpoint. Tokens must carry it as their audience (`aud`). Defaults to `FHIR_MCP_SERVER_URL` (or `http://<host>:<port>`) followed by `/mcp`.
+- `FHIR_MCP_TOKEN_VALIDATION`: `jwks` (default; checks the token's signature against the IdP's published keys) or `introspection` (asks the IdP about every new token; works for opaque tokens and sees revocations immediately).
+- `FHIR_MCP_JWKS_URI`: Overrides the JWKS URL discovered from the IdP.
+- `FHIR_MCP_INTROSPECTION_CLIENT_ID` / `FHIR_MCP_INTROSPECTION_CLIENT_SECRET`: Credentials the server uses to call the IdP's introspection endpoint. Required with `introspection`.
+- `FHIR_MCP_READ_SCOPE` / `FHIR_MCP_WRITE_SCOPE` / `FHIR_MCP_DELETE_SCOPE`: Scope names required by the read tools (`get_capabilities`, `search`, `read`, `get_user`), the write tools (`create`, `update`) and `delete`. Defaults: `fhir-read`, `fhir-write`, `fhir-delete`.
+
+**FHIR Server Configuration (MCP Server ↔ FHIR Server):**
 - `FHIR_SERVER_BASE_URL`: The base URL of the FHIR server (e.g., `https://hapi.fhir.org/baseR4`). This is used to generate tool URIs and to route FHIR requests.
-- `FHIR_SERVER_SCOPES`: A space-separated list of OAuth2 scopes to request from the FHIR authorization server (e.g., `user/Patient.read user/Observation.read`). Add `fhirUser openid` to enable retrieval of user context for the `get_user` tool. If these two scopes are not configured, the `get_user` tool returns an empty result because the ID token lacks the user's FHIR resource reference.
-- `FHIR_SERVER_ACCESS_TOKEN`: The access token to use for authenticating requests to the FHIR server. If this variable is set, the server will bypass the OAuth2 authorization flow and use this token directly for all requests.
+- `FHIR_SERVER_AUTH_MODE`: How the server authenticates to the FHIR server: `none` or `static_token`. Defaults to `static_token` when `FHIR_SERVER_ACCESS_TOKEN` is set, otherwise `none`. The MCP client's token is never forwarded to the FHIR server.
+- `FHIR_SERVER_ACCESS_TOKEN`: The token sent to the FHIR server in `static_token` mode.
 
 > [!NOTE]
-> `FHIR_SERVER_ACCESS_TOKEN` is intended for local `stdio` mode deployments only, as a convenience to bypass interactive OAuth authentication. Do not use this variable when the MCP server is exposed over a network or the public internet.
+> `FHIR_SERVER_ACCESS_TOKEN` gives every caller the same access to the FHIR server. Use it for local `stdio` deployments or development, not for a server exposed over a network.
+
+> [!IMPORTANT]
+> `FHIR_SERVER_DISABLE_AUTHORIZATION` has been removed. The server refuses to start while it is set; use `FHIR_MCP_AUTH_MODE` and `FHIR_SERVER_AUTH_MODE` instead.
+
+### Authorization
+
+The server follows the [MCP 2026-07-28 authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization):
+
+1. A client calls `/mcp` without a token and receives `401` with a `WWW-Authenticate` header pointing to `/.well-known/oauth-protected-resource/mcp`.
+2. That metadata names your IdP. The client signs the user in there (authorization code with PKCE) and asks for a token for the MCP endpoint.
+3. The client calls `/mcp` with `Authorization: Bearer <token>`. The server checks the signature (or introspects the token), the issuer, the audience, the expiry and the tool's scope.
+4. A token without a tool's scope gets `403` with `error="insufficient_scope"` and the scope it needs, so the client can ask the user for more access.
+
+To set up an IdP:
+- Register the MCP server as a resource server (API) whose identifier is `FHIR_MCP_RESOURCE_URL`, e.g. `http://localhost:8000/mcp`.
+- Define the read, write and delete permissions (scopes) and grant them to users through roles.
+- Register each MCP client (MCP Inspector, Claude, VS Code) with its redirect URI, or enable Client ID Metadata Documents or Dynamic Client Registration if your IdP supports them.
+- To let `get_user` find the signed-in user's FHIR record, add a `fhirUser` claim (e.g. `Patient/123` or `Practitioner/456`) to the access token.
 
 ## Tools
 

@@ -18,13 +18,11 @@ import pytest
 import time
 import json
 from unittest.mock import AsyncMock, Mock, patch
-from starlette.responses import HTMLResponse
 
 from fhir_mcp_server.oauth.common import (
     discover_oauth_metadata,
     is_token_expired,
     get_endpoint,
-    handle_failed_authentication,
     generate_code_verifier,
     generate_code_challenge,
     perform_token_flow,
@@ -224,28 +222,6 @@ class TestGetEndpoint:
             Exception, match="nonexistent_endpoint not found in metadata"
         ):
             get_endpoint(metadata, "nonexistent_endpoint")
-
-
-class TestHandleAuthentication:
-    """Test the authentication handling functions."""
-
-    def test_handle_failed_authentication_default(self):
-        """Test failed authentication response with default message."""
-        response = handle_failed_authentication()
-
-        assert response.status_code == 200
-        assert "Authentication Failed!" in bytes(response.body).decode()
-        assert "text/html" in response.media_type
-
-    def test_handle_failed_authentication_custom_error(self):
-        """Test failed authentication response with custom error."""
-        error_desc = "Invalid credentials provided"
-        response = handle_failed_authentication(error_desc)
-
-        assert response.status_code == 200
-        body = bytes(response.body).decode()
-        assert "Authentication Failed!" in body
-        assert error_desc in body
 
 
 class TestGenerateCodeVerifier:

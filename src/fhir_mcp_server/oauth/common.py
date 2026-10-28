@@ -26,7 +26,6 @@ from typing import Dict
 
 from fhir_mcp_server.oauth.types import OAuthMetadata, OAuthToken
 from mcp.shared._httpx_utils import create_mcp_http_client
-from starlette.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
 
@@ -67,25 +66,6 @@ def get_endpoint(metadata, endpoint: str) -> str:
     return str(value)
 
 
-def handle_failed_authentication(error_desc: str = "") -> HTMLResponse:
-    return HTMLResponse(
-        f"""
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>FHIR MCP Server | Authentication Complete</title>
-            </head>
-            <body style="font-family:Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#F5F5F5;">
-            <div style="text-align:center;padding:20px;background:#F7C6C7;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);width:400px;">
-                <h2 style="color:#000000;margin:0 0 16px;">Authentication Failed!</h2>
-                <p style="color:#000000;margin:0 0 20px;">{error_desc}. Please try again!</p>
-            </div>
-            </body>
-        </html>
-        """
-    )
-
-
 def generate_code_verifier(length: int = 128) -> str:
     """Generate a cryptographically random code verifier for PKCE (RFC 7636)."""
     if not (43 <= length <= 128):
@@ -121,7 +101,7 @@ async def perform_token_flow(
                 timeout=timeout,
             )
             logger.debug(
-                f"Token endpoint response: {response.status_code} - {response.text}"
+                f"Token endpoint response status: {response.status_code}"
             )
 
             if response.status_code != 200:

@@ -15,7 +15,7 @@ cryptography==50.0.2
 fhirpathpy==2.2.0
 fhirpy==2.2.0
 frozenlist==1.8.0
-h11==0.16.0 ; sys_platform != 'emscripten'
+h11==0.16.0
 httpcore2==2.16.0 ; sys_platform != 'emscripten'
 httpx2==2.16.0
 httpx2-jsfetch==1.0 ; sys_platform == 'emscripten'
@@ -53,5 +53,5 @@ typer==0.27.3
 typing-extensions==4.16.0
 typing-inspection==0.4.4
 urllib3==2.8.0
-uvicorn==0.54.0 ; sys_platform != 'emscripten'
+uvicorn==0.54.0
 yarl==1.25.1

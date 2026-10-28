@@ -19,6 +19,7 @@ import os
 from unittest.mock import patch
 from pydantic import AnyHttpUrl, ValidationError
 from fhir_mcp_server.oauth.types import (
+    ConfigurationError,
     ServerConfigs,
     OAuthMetadata,
     OAuthToken,
@@ -77,37 +78,72 @@ class TestServerConfigs:
             assert config.server_base_url == "https://example.com/fhir"
             assert config.mcp_request_timeout == 120
 
-    def test_callback_url_basic(self):
-        """Test callback URL generation."""
+    def test_default_authorization_settings(self):
+        """MCP authorization defaults to resource-server mode with per-tool scopes."""
         with patch.dict(os.environ, {}, clear=True):
             config = ServerConfigs(_env_file=None)
-            callback_url = config.callback_url("https://example.com:8000")
-            assert str(callback_url) == "https://example.com:8000/oauth/callback"
+            assert config.mcp_auth_mode == "resource_server"
+            assert config.mcp_token_validation == "jwks"
+            assert (config.mcp_read_scope, config.mcp_write_scope, config.mcp_delete_scope) == (
+                "fhir-read", "fhir-write", "fhir-delete"
+            )
 
-    def test_callback_url_custom_suffix(self):
-        """Test callback URL generation with custom suffix."""
+    def test_effective_resource_url_defaults_to_mcp_endpoint(self):
         with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(mcp_server_url="https://mcp.example.com/", _env_file=None)
+            assert config.effective_resource_url == "https://mcp.example.com/mcp"
+
+    def test_effective_resource_url_explicit(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(mcp_resource_url="https://mcp.example.com/fhir/mcp/", _env_file=None)
+            assert config.effective_resource_url == "https://mcp.example.com/fhir/mcp"
+
+    def test_server_auth_mode_follows_static_token(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert ServerConfigs(_env_file=None).effective_server_auth_mode == "none"
+            config = ServerConfigs(server_access_token="abc", _env_file=None)
+            assert config.effective_server_auth_mode == "static_token"
+
+    def test_allowed_hosts_and_origins_split(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(
+                mcp_allowed_hosts="mcp.example.com, mcp.example.com:443",
+                mcp_allowed_origins="https://app.example.com",
+                _env_file=None,
+            )
+            assert config.allowed_hosts == ["mcp.example.com", "mcp.example.com:443"]
+            assert config.allowed_origins == ["https://app.example.com"]
+
+    def test_startup_rejects_removed_disable_authorization(self):
+        with patch.dict(os.environ, {"FHIR_SERVER_DISABLE_AUTHORIZATION": "True"}, clear=True):
             config = ServerConfigs(_env_file=None)
-            callback_url = config.callback_url("https://example.com:8000", "/custom/fhir")
-            assert str(callback_url) == "https://example.com:8000/custom/fhir"
+            with pytest.raises(ConfigurationError, match="FHIR_MCP_AUTH_MODE=disabled"):
+                config.validate_for_startup()
 
-    def test_discovery_url_property(self):
-        """Test discovery URL property."""
+    def test_startup_requires_issuer_in_resource_server_mode(self):
         with patch.dict(os.environ, {}, clear=True):
-            config = ServerConfigs(server_base_url="https://custom.fhir.org/R4", _env_file=None)
-            assert (
-                config.discovery_url
-                == "https://custom.fhir.org/R4/.well-known/smart-configuration"
-            )
+            with pytest.raises(ConfigurationError, match="FHIR_MCP_IDP_ISSUER"):
+                ServerConfigs(_env_file=None).validate_for_startup()
+            ServerConfigs(mcp_auth_mode="disabled", _env_file=None).validate_for_startup()
+            ServerConfigs(mcp_idp_issuer="https://idp.example.com", _env_file=None).validate_for_startup()
 
-    def test_discovery_url_with_trailing_slash(self):
-        """Test discovery URL property with trailing slash."""
+    def test_startup_requires_introspection_client(self):
         with patch.dict(os.environ, {}, clear=True):
-            config = ServerConfigs(server_base_url="https://custom.fhir.org/R4/", _env_file=None)
-            assert (
-                config.discovery_url
-                == "https://custom.fhir.org/R4/.well-known/smart-configuration"
+            config = ServerConfigs(
+                mcp_idp_issuer="https://idp.example.com",
+                mcp_token_validation="introspection",
+                _env_file=None,
             )
+            with pytest.raises(ConfigurationError, match="INTROSPECTION_CLIENT"):
+                config.validate_for_startup()
+
+    def test_startup_requires_token_for_static_token_mode(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(
+                mcp_auth_mode="disabled", server_auth_mode="static_token", _env_file=None
+            )
+            with pytest.raises(ConfigurationError, match="FHIR_SERVER_ACCESS_TOKEN"):
+                config.validate_for_startup()
 
     def test_metadata_url_property(self):
         """Test metadata URL property."""
