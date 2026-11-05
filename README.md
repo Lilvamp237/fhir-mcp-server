@@ -230,7 +230,7 @@ To use a different FHIR server, run the FHIR MCP server container with `FHIR_SER
 
    ```bash
    docker build -t fhir-mcp-server .
-   docker run -d --name fhir-mcp-server-hapi --network fhir-network -p 127.0.0.1:8000:8000      -e FHIR_SERVER_BASE_URL=http://hapi-fhir-server:8080/fhir      -e FHIR_MCP_HOST=0.0.0.0      -e FHIR_SERVER_DISABLE_AUTHORIZATION=True      fhir-mcp-server
+   docker run -d --name fhir-mcp-server-hapi --network fhir-network -p 127.0.0.1:8000:8000      -e FHIR_SERVER_BASE_URL=http://hapi-fhir-server:8080/fhir      -e FHIR_MCP_HOST=0.0.0.0      -e FHIR_MCP_AUTH_MODE=disabled      fhir-mcp-server
    ```
 
    The FHIR MCP server listens on http://localhost:8000.

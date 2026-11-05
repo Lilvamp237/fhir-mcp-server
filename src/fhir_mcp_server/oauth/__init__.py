@@ -1,4 +1,4 @@
-# Copyright (c) 2025, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
+# Copyright (c) 2025-2026, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
 
 # WSO2 LLC. licenses this file to you under the Apache License,
 # Version 2.0 (the "License"); you may not use this file except
@@ -14,11 +14,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from .types import ServerConfigs, OAuthToken, IDToken, decode_jws
+from .types import ServerConfigs, IDToken
 
 __all__ = [
-    "OAuthToken",
     "ServerConfigs",
     "IDToken",
-    "decode_jws",
 ]

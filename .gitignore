@@ -49,3 +49,12 @@ wheels/
 .coverage
 htmlcov/
 .tox/
+
+
+# Local secrets and certificates
+.env
+.env.*
+!.env.example
+thunderid.cert
+*.pem
+*.key

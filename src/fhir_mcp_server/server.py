@@ -33,10 +33,11 @@ from fhir_mcp_server.utils import (
     validate_inputs,
 )
 from fhir_mcp_server.auth import ToolScopeMiddleware, create_token_verifier, tool_scopes
+from fhir_mcp_server.backend_auth import BackendAuthError, SystemTokenProvider
+from fhir_mcp_server.fhir_connect import FhirConnect
 from fhir_mcp_server.oauth import IDToken, ServerConfigs
 from fhir_mcp_server.oauth.types import ConfigurationError
 from fhirpy import AsyncFHIRClient
-from fhirpy.lib import AsyncFHIRResource
 from fhirpy.base.exceptions import OperationOutcome, ResourceNotFound
 from fhirpy.base.searchset import Raw
 from typing import Dict, Any, List
@@ -48,9 +49,14 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.routes import build_resource_metadata_url
 from mcp.server.auth.settings import AuthSettings
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.exceptions import UrlElicitationRequiredError
+from mcp_types import ElicitRequest, ElicitRequestURLParams, InputRequiredResult
+from mcp_types.version import is_version_at_least
 from importlib.metadata import PackageNotFoundError, version
+
+import secrets
 
 import uvicorn
 
@@ -63,15 +69,46 @@ except PackageNotFoundError:
 
 configs: ServerConfigs = ServerConfigs()
 
+system_token_provider: SystemTokenProvider = SystemTokenProvider(configs)
 
-def get_backend_access_token() -> str | None:
+# Per-user FHIR sign-ins (FHIR_SERVER_AUTH_MODE=user_smart_login); replaced by configure_mcp_server().
+fhir_connect: FhirConnect = FhirConnect(configs)
+
+FHIR_CONNECT_MESSAGE = (
+    "Connect your FHIR server account to continue. Sign in with the link, then retry the request."
+)
+
+
+async def get_backend_access_token() -> str | None:
     """
     The credential sent to the FHIR server, chosen by FHIR_SERVER_AUTH_MODE.
     The MCP access token is never forwarded to the FHIR server.
     """
-    if configs.effective_server_auth_mode == "static_token":
+    mode: str = configs.effective_server_auth_mode
+    if mode == "static_token":
         return configs.server_access_token
+    if mode in ("client_credentials", "private_key_jwt"):
+        return await system_token_provider.get_token()
+    if mode == "user_smart_login":
+        access_token: AccessToken | None = get_access_token()
+        token = await fhir_connect.user_token(access_token.subject) if access_token and access_token.subject else None
+        if token is None:
+            raise BackendAuthError("The user has not connected their FHIR server account.")
+        return token
     return None
+
+
+async def get_metadata_access_token() -> str | None:
+    """
+    The credential for the metadata endpoint. A per-user server's metadata is public
+    (SMART), so a user who has not connected yet reads it without a token.
+    """
+    if configs.effective_server_auth_mode == "user_smart_login":
+        try:
+            return await get_backend_access_token()
+        except BackendAuthError:
+            return None
+    return await get_backend_access_token()
 
 
 async def get_async_fhir_client() -> AsyncFHIRClient:
@@ -83,7 +120,7 @@ async def get_async_fhir_client() -> AsyncFHIRClient:
         "config": configs,
         "extra_headers": get_default_headers(),
     }
-    access_token: str | None = get_backend_access_token()
+    access_token: str | None = await get_backend_access_token()
     if access_token:
         client_kwargs["access_token"] = access_token
     return await create_async_fhir_client(**client_kwargs)
@@ -104,6 +141,46 @@ async def check_tool_scope(tool: str) -> Dict[str, Any] | None:
     return await get_operation_outcome(
         code="forbidden",
         diagnostics=f"The access token does not grant the '{required}' scope required by '{tool}'.",
+    )
+
+
+async def check_tool_access(tool: str, ctx: Context) -> Dict[str, Any] | InputRequiredResult | None:
+    """
+    The tool's scope check, then, with FHIR_SERVER_AUTH_MODE=user_smart_login, whether
+    the user has connected their FHIR server account. If not, the client is asked to
+    open a sign-in link (URL-mode elicitation): an `InputRequiredResult` on 2026-07-28,
+    a URL elicitation error on earlier protocol versions.
+    Returns None when the tool may run.
+    """
+    if outcome := await check_tool_scope(tool):
+        return outcome
+    if configs.effective_server_auth_mode != "user_smart_login":
+        return None
+    access_token: AccessToken | None = get_access_token()
+    if access_token is None or not access_token.subject:
+        return None
+    if await fhir_connect.user_token(access_token.subject):
+        return None
+
+    link: str = fhir_connect.connect_link(access_token.subject)
+    capabilities = ctx.client_capabilities
+    supports_url = bool(capabilities and capabilities.elicitation and capabilities.elicitation.url)
+    if is_version_at_least(ctx.protocol_version or "", "2026-07-28"):
+        # Every 2026-07-28 request carries the client's capabilities.
+        if not supports_url:
+            return await get_operation_outcome(code="login", diagnostics=f"{FHIR_CONNECT_MESSAGE} {link}")
+        return InputRequiredResult(
+            input_requests={"fhir-connect": ElicitRequest(params=ElicitRequestURLParams(message=FHIR_CONNECT_MESSAGE, url=link))}
+        )
+    if capabilities is not None and not supports_url:
+        # An earlier-protocol client that declared it cannot open links.
+        return await get_operation_outcome(code="login", diagnostics=f"{FHIR_CONNECT_MESSAGE} {link}")
+    # Earlier protocols send capabilities only at initialize, so a stateless request
+    # usually carries none. The URL elicitation error (-32042) lets clients that support
+    # it show the link; its message repeats the link for clients that do not.
+    raise UrlElicitationRequiredError(
+        [ElicitRequestURLParams(message=FHIR_CONNECT_MESSAGE, url=link, elicitation_id=secrets.token_urlsafe(16))],
+        message=f"{FHIR_CONNECT_MESSAGE} {link}",
     )
 
 
@@ -137,7 +214,12 @@ def configure_mcp_server() -> MCPServer:
         logger.warning("MCP authorization is disabled.")
     if configs.effective_server_auth_mode == "none":
         logger.warning("Requests to the FHIR server carry no credential (FHIR_SERVER_AUTH_MODE=none).")
-    return MCPServer(**mcp_kwargs)
+    mcp: MCPServer = MCPServer(**mcp_kwargs)
+    if configs.effective_server_auth_mode == "user_smart_login":
+        global fhir_connect
+        fhir_connect = FhirConnect(configs)
+        fhir_connect.register_routes(mcp)
+    return mcp
 
 
 def http_transport_options(transport: str) -> Dict[str, Any]:
@@ -220,7 +302,9 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             logger.debug(f"Invoked with resource_type='{type}'")
             if outcome := await validate_resource_type(type):
                 return outcome
-            data: Dict[str, Any] = await get_capability_statement(configs.metadata_url)
+            data: Dict[str, Any] = await get_capability_statement(
+                configs.metadata_url, await get_metadata_access_token()
+            )
             for resource in data["rest"][0]["resource"]:
                 if resource.get("type") == type:
                     logger.info(
@@ -259,6 +343,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
         )
     )
     async def search(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -298,7 +383,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             description="A dictionary containing the full FHIR resource instance matching the search criteria."
         ),
     ]:
-        if outcome := await check_tool_scope("search"):
+        if outcome := await check_tool_access("search", ctx):
             return outcome
         try:
             logger.debug(f"Invoked with type='{type}' and searchParam={searchParam}")
@@ -348,6 +433,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
         )
     )
     async def read(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -395,7 +481,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             description="A dictionary containing the single FHIR resource instance of the requested type and id."
         ),
     ]:
-        if outcome := await check_tool_scope("read"):
+        if outcome := await check_tool_access("read", ctx):
             return outcome
         try:
             logger.debug(
@@ -460,6 +546,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
         )
     )
     async def create(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -515,7 +602,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             )
         ),
     ]:
-        if outcome := await check_tool_scope("create"):
+        if outcome := await check_tool_access("create", ctx):
             return outcome
         try:
             logger.debug(
@@ -571,6 +658,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
         )
     )
     async def update(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -627,7 +715,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
         Dict[str, Any],
         Field(description="A dictionary containing the updated FHIR resource"),
     ]:
-        if outcome := await check_tool_scope("update"):
+        if outcome := await check_tool_access("update", ctx):
             return outcome
         try:
             logger.debug(
@@ -682,6 +770,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
         )
     )
     async def delete(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -720,7 +809,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             description="A dictionary containing the confirmation of deletion or details on why deletion failed."
         ),
     ]:
-        if outcome := await check_tool_scope("delete"):
+        if outcome := await check_tool_access("delete", ctx):
             return outcome
         try:
             logger.debug(
@@ -778,13 +867,13 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             "Use this tool when you need to access the current user's demographic and contact details."
         )
     )
-    async def get_user() -> Annotated[
+    async def get_user(ctx: Context) -> Annotated[
         list[Dict[str, Any]] | Dict[str, Any],
         Field(
             description="A dictionary containing the authenticated user's demographic information such as 'id', 'name', and 'birthDate'."
         ),
     ]:
-        if outcome := await check_tool_scope("get_user"):
+        if outcome := await check_tool_access("get_user", ctx):
             return outcome
         try:
             logger.debug("Retrieving authenticated user's profile.")
@@ -904,3 +993,4 @@ def main(transport, log_level) -> int:
         )
         return 1
     return 0
+

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
+# Copyright (c) 2025-2026, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
 
 # WSO2 LLC. licenses this file to you under the Apache License,
 # Version 2.0 (the "License"); you may not use this file except
@@ -14,12 +14,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import base64
-import json
 import logging
 
-from typing import Any, Dict, Literal
-from pydantic import AnyHttpUrl, BaseModel
+from typing import Literal
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -68,14 +66,29 @@ class ServerConfigs(BaseSettings):
     mcp_read_scope: str = "fhir-read"
     mcp_write_scope: str = "fhir-write"
     mcp_delete_scope: str = "fhir-delete"
+    # user_smart_login: confidential web client at the IdP, used to confirm who opens a connect link
+    mcp_connect_client_id: str = ""
+    mcp_connect_client_secret: str = ""
 
     # FHIR settings
     server_base_url: str = ""
-    server_auth_mode: Literal["none", "static_token"] | None = None
+    server_auth_mode: (
+        Literal["none", "static_token", "client_credentials", "private_key_jwt", "user_smart_login"] | None
+    ) = None
     server_access_token: str | None = None
+    # System credentials (client_credentials, private_key_jwt) and per-user sign-in (user_smart_login)
+    server_authorize_url: str | None = None  # user_smart_login; defaults to the FHIR server's SMART configuration
+    server_token_url: str | None = None  # defaults to the FHIR server's SMART configuration
+    server_token_resource: str | None = None  # RFC 8707 resource for the system token
     server_client_id: str = ""
     server_client_secret: str = ""
+    server_private_key_file: str = ""  # PEM private key for private_key_jwt
+    server_private_key_id: str | None = None  # `kid` of that key in the registered JWKS
+    server_jwt_algorithm: Literal["RS384", "ES384", "RS256", "ES256"] = "RS384"
     server_scopes: str = ""
+    # Extra CA certificate trusted for the FHIR server and its token endpoints (e.g. a
+    # self-signed IdP or gateway); added to the system trust store, never replacing it.
+    server_ca_cert: str | None = None
     # Removed in favour of FHIR_MCP_AUTH_MODE and FHIR_SERVER_AUTH_MODE; rejected at startup.
     server_disable_authorization: str | None = None
 
@@ -132,87 +145,35 @@ class ServerConfigs(BaseSettings):
                     "FHIR_MCP_INTROSPECTION_CLIENT_ID and FHIR_MCP_INTROSPECTION_CLIENT_SECRET are "
                     "required when FHIR_MCP_TOKEN_VALIDATION=introspection."
                 )
-        if self.effective_server_auth_mode == "static_token" and not self.server_access_token:
+        mode = self.effective_server_auth_mode
+        if mode == "static_token" and not self.server_access_token:
             raise ConfigurationError(
                 "FHIR_SERVER_ACCESS_TOKEN is required when FHIR_SERVER_AUTH_MODE=static_token."
             )
-
-    def __init__(self, **data):
-        """Initialize settings with values from environment variables"""
-        super().__init__(**data)
-
-
-class OAuthMetadata(BaseModel):
-    """
-    OAuth 2.0 Authorization Server Metadata.
-    """
-
-    issuer: AnyHttpUrl
-    authorization_endpoint: AnyHttpUrl
-    token_endpoint: AnyHttpUrl
-    registration_endpoint: AnyHttpUrl | None = None
-    scopes_supported: list[str] | None = None
-    response_types_supported: list[str]
-    response_modes_supported: list[str] | None = None
-    grant_types_supported: list[str] | None = None
-    token_endpoint_auth_methods_supported: list[str] | None = None
-    token_endpoint_auth_signing_alg_values_supported: list[str] | None = None
-    service_documentation: AnyHttpUrl | None = None
-    ui_locales_supported: list[str] | None = None
-    op_policy_uri: AnyHttpUrl | None = None
-    op_tos_uri: AnyHttpUrl | None = None
-    revocation_endpoint: AnyHttpUrl | None = None
-    revocation_endpoint_auth_methods_supported: list[str] | None = None
-    revocation_endpoint_auth_signing_alg_values_supported: None = None
-    introspection_endpoint: AnyHttpUrl | None = None
-    introspection_endpoint_auth_methods_supported: list[str] | None = None
-    introspection_endpoint_auth_signing_alg_values_supported: None = None
-    code_challenge_methods_supported: list[str] | None = None
-
-
-class OAuthToken(BaseModel):
-    """
-    OAuth 2.0 token with metadata.
-    """
-
-    access_token: str
-    token_type: str
-    expires_in: int | None = None
-    scope: str | None = None
-    refresh_token: str | None = None
-    expires_at: float | None = None
-    id_token: str | None = None
-    client_id: str | None = None
-
-    @property
-    def scopes(self) -> list[str]:
-        return self.scope.split(" ") if self.scope else []
-
-    def get_id_token(self) -> "IDToken | None":
-        """
-        Parse the id_token and return an IDToken object.
-
-        Returns:
-            An IDToken instance populated from the JWT payload or None if parsing fails.
-        """
-        payload: Dict[str, Any] | None = (
-            decode_jws(self.id_token) if self.id_token else None
-        )
-        if not payload:
-            return None
-
-        return IDToken.model_validate(payload)
-
-
-class AuthorizationCode(BaseModel):
-    code: str
-    scopes: list[str]
-    expires_at: float
-    client_id: str
-    code_verifier: str
-    code_challenge: str
-    redirect_uri: AnyHttpUrl
-    redirect_uri_provided_explicitly: bool
+        if mode == "user_smart_login":
+            if self.mcp_auth_mode != "resource_server":
+                raise ConfigurationError(
+                    "FHIR_SERVER_AUTH_MODE=user_smart_login needs FHIR_MCP_AUTH_MODE=resource_server, "
+                    "because each user's FHIR sign-in is tied to their MCP login."
+                )
+            if not (self.mcp_connect_client_id and self.mcp_connect_client_secret):
+                raise ConfigurationError(
+                    "FHIR_MCP_CONNECT_CLIENT_ID and FHIR_MCP_CONNECT_CLIENT_SECRET are required when "
+                    "FHIR_SERVER_AUTH_MODE=user_smart_login: a web client at your identity provider with "
+                    "redirect URI <server URL>/connect/idp/callback."
+                )
+        if mode in ("client_credentials", "private_key_jwt", "user_smart_login") and not self.server_client_id:
+            raise ConfigurationError(
+                f"FHIR_SERVER_CLIENT_ID is required when FHIR_SERVER_AUTH_MODE={mode}."
+            )
+        if mode == "client_credentials" and not self.server_client_secret:
+            raise ConfigurationError(
+                "FHIR_SERVER_CLIENT_SECRET is required when FHIR_SERVER_AUTH_MODE=client_credentials."
+            )
+        if mode == "private_key_jwt" and not self.server_private_key_file:
+            raise ConfigurationError(
+                "FHIR_SERVER_PRIVATE_KEY_FILE is required when FHIR_SERVER_AUTH_MODE=private_key_jwt."
+            )
 
 
 class IDToken(BaseModel):
@@ -251,27 +212,3 @@ class IDToken(BaseModel):
         """Get the FHIR resource ID from fhirUser URL."""
         parsed = self.parse_fhir_user()
         return parsed[1] if parsed else None
-
-
-def decode_jws(jws: str) -> Dict[str, Any] | None:
-    """
-    Decode the provided JWS payload.
-
-    Returns:
-        The decoded JWS payload as a dictionary.
-    """
-    try:
-        parts: list[str] = jws.split(".")
-        if len(parts) != 3:
-            logger.debug(
-                f"Decoding JWS failed: Invalid JWS format, expected 3 parts but got {len(parts)}: {jws}"
-            )
-            return None
-
-        padded: str = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        decoded: bytes = base64.urlsafe_b64decode(padded)
-        return json.loads(decoded)
-
-    except Exception as e:
-        logger.exception("Error decoding JWS token. Caused by, ", exc_info=e)
-        return None

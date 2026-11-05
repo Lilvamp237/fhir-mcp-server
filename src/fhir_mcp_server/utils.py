@@ -20,6 +20,7 @@ import re
 
 from pydantic import ValidationError
 
+from fhir_mcp_server.backend_auth import fhir_tls
 from fhir_mcp_server.oauth import ServerConfigs
 
 from typing import Any, Dict, List, Optional
@@ -45,6 +46,8 @@ async def create_async_fhir_client(
     }
     if access_token:
         client_kwargs["authorization"] = f"Bearer {access_token}"
+    if config.server_ca_cert:
+        client_kwargs["aiohttp_config"]["ssl"] = fhir_tls(config)
 
     return AsyncFHIRClient(**client_kwargs)
 
@@ -183,14 +186,18 @@ async def get_operation_outcome(
     }
 
 
-async def get_capability_statement(metadata_url: str) -> Dict[str, Any]:
+async def get_capability_statement(metadata_url: str, access_token: str | None = None) -> Dict[str, Any]:
     """
     Discover CapabilityStatement from server's metadata endpoint.
+    The backend credential is sent when there is one (e.g. a gateway protects metadata too).
     """
+    headers = get_default_headers()
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
     try:
         logger.debug(f"Fetching CapabilityStatement from {metadata_url}")
         async with create_mcp_http_client() as client:
-            response = await client.get(url=metadata_url, headers=get_default_headers())
+            response = await client.get(url=metadata_url, headers=headers)
             response.raise_for_status()
             metadata_json = response.json()
             logger.debug(f"OAuth metadata discovered: {metadata_json}")
@@ -236,3 +243,4 @@ def build_user_profile(resource: Dict[str, Any]) -> Dict[str, Any]:
             profile[field] = value
 
     return profile
+
