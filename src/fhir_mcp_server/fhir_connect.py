@@ -137,7 +137,13 @@ class FhirConnect:
                 logger.info("Could not refresh the FHIR token for a user; asking them to connect again: %s", ex)
                 self._store.delete(f"user:{sub}")
                 return None
-            return self._save_user_tokens(sub, tokens, record.get("refresh_token"))
+            return self._save_user_tokens(sub, tokens, record)
+
+    def user_patient(self, sub: str) -> str | None:
+        """The patient the user's FHIR sign-in is limited to (SMART `patient` launch
+        context), if the FHIR server returned one; for example a MyChart login."""
+        record = self._store.get(f"user:{sub}")
+        return record.get("patient") if record else None
 
     # Browser routes
 
@@ -241,9 +247,11 @@ class FhirConnect:
     def _url(self, path: str) -> str:
         return f"{self._configs.effective_server_url.rstrip('/')}{path}"
 
-    def _save_user_tokens(self, sub: str, tokens: Dict[str, Any], previous_refresh: str | None) -> str:
+    def _save_user_tokens(self, sub: str, tokens: Dict[str, Any], previous: Dict[str, Any] | None) -> str:
+        """Keep the user's tokens; a refresh response may omit the refresh token and patient."""
+        previous = previous or {}
         access_token = str(tokens["access_token"])
-        refresh_token = tokens.get("refresh_token") or previous_refresh
+        refresh_token = tokens.get("refresh_token") or previous.get("refresh_token")
         expires_in = float(tokens.get("expires_in") or DEFAULT_EXPIRES_IN_SECONDS)
         keep = REFRESH_TOKEN_KEEP_SECONDS if refresh_token else expires_in
         now = time.time()
@@ -256,6 +264,7 @@ class FhirConnect:
                 "refresh_token": refresh_token,
                 "expires_at": now + expires_in,
                 "refresh_at": now + expires_in - margin,
+                "patient": tokens.get("patient") or previous.get("patient"),
             },
             keep,
         )

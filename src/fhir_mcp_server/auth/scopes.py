@@ -26,7 +26,7 @@ specification describes for step-up authorization.
 import json
 import logging
 
-from typing import Dict, List
+from typing import Any, Callable, Dict, List
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -67,10 +67,17 @@ def _called_tools(body: bytes) -> List[str]:
 class ToolScopeMiddleware:
     """ASGI middleware, placed after the SDK's bearer authentication."""
 
-    def __init__(self, app: ASGIApp, scopes: Dict[str, str], resource_metadata_url: str) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        scopes: Dict[str, str],
+        resource_metadata_url: str,
+        can_gain_scope: Callable[[Dict[str, Any]], bool],
+    ) -> None:
         self.app = app
         self.scopes = scopes
         self.resource_metadata_url = resource_metadata_url
+        self.can_gain_scope = can_gain_scope
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         auth = scope.get("auth")
@@ -98,7 +105,10 @@ class ToolScopeMiddleware:
                 if name in self.scopes and self.scopes[name] not in auth.scopes
             }
         )
-        if missing:
+        access_token = getattr(scope.get("user"), "access_token", None)
+        # 403 invites the client to sign in again for the scope. When that cannot help, the
+        # request continues and the tool itself answers that the account is not allowed.
+        if missing and self.can_gain_scope(getattr(access_token, "claims", None) or {}):
             logger.info("Rejected tool call: token lacks scope(s) %s", " ".join(missing))
             await self._insufficient_scope(send, " ".join(missing))
             return

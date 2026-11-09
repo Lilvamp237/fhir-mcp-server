@@ -48,13 +48,12 @@ class ServerConfigs(BaseSettings):
     mcp_port: int = 8000
     mcp_server_url: str | None = None
     mcp_request_timeout: int = 30  # in secs
-    # Space- or comma-separated Host and Origin values accepted on HTTP transports.
-    # Empty keeps the SDK default (DNS-rebinding protection for localhost only).
     mcp_allowed_hosts: str = ""
     mcp_allowed_origins: str = ""
     mcp_max_request_body_bytes: int | None = None
+    mcp_read_only: bool = False
 
-    # MCP authorization: the MCP server is an OAuth resource server; the IdP issues tokens.
+    # MCP authorization: the MCP server is an OAuth resource server.
     mcp_auth_mode: Literal["resource_server", "disabled"] = "resource_server"
     mcp_idp_issuer: str = ""
     mcp_idp_ca_cert: str | None = None  # CA bundle for an IdP with a self-signed certificate
@@ -76,20 +75,23 @@ class ServerConfigs(BaseSettings):
         Literal["none", "static_token", "client_credentials", "private_key_jwt", "user_smart_login"] | None
     ) = None
     server_access_token: str | None = None
-    # System credentials (client_credentials, private_key_jwt) and per-user sign-in (user_smart_login)
+    # System credentials and per-user sign-in
     server_authorize_url: str | None = None  # user_smart_login; defaults to the FHIR server's SMART configuration
-    server_token_url: str | None = None  # defaults to the FHIR server's SMART configuration
-    server_token_resource: str | None = None  # RFC 8707 resource for the system token
+    server_token_url: str | None = None
+    server_token_resource: str | None = None
     server_client_id: str = ""
     server_client_secret: str = ""
-    server_private_key_file: str = ""  # PEM private key for private_key_jwt
-    server_private_key_id: str | None = None  # `kid` of that key in the registered JWKS
+    server_private_key_file: str = ""
+    server_private_key_id: str | None = None
     server_jwt_algorithm: Literal["RS384", "ES384", "RS256", "ES256"] = "RS384"
     server_scopes: str = ""
-    # Extra CA certificate trusted for the FHIR server and its token endpoints (e.g. a
-    # self-signed IdP or gateway); added to the system trust store, never replacing it.
     server_ca_cert: str | None = None
-    # Removed in favour of FHIR_MCP_AUTH_MODE and FHIR_SERVER_AUTH_MODE; rejected at startup.
+
+    # Access policy for signed-in users (see fhir_mcp_server.policy)
+    policy_patient_writes: Literal["deny", "own"] = "deny"
+    policy_caregivers: bool = True  # RelatedPerson and Person users
+    policy_shared_types: str = "Practitioner PractitionerRole Organization Location Medication"
+
     server_disable_authorization: str | None = None
 
     @property

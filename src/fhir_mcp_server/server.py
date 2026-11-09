@@ -37,6 +37,19 @@ from fhir_mcp_server.backend_auth import BackendAuthError, SystemTokenProvider
 from fhir_mcp_server.fhir_connect import FhirConnect
 from fhir_mcp_server.oauth import IDToken, ServerConfigs
 from fhir_mcp_server.oauth.types import ConfigurationError
+from fhir_mcp_server.policy import (
+    Access,
+    AccessResolver,
+    PolicyDenied,
+    Rules,
+    allows,
+    audit,
+    can_gain_scope,
+    check_blocked,
+    check_search,
+    check_write,
+    filter_result,
+)
 from fhirpy import AsyncFHIRClient
 from fhirpy.base.exceptions import OperationOutcome, ResourceNotFound
 from fhirpy.base.searchset import Raw
@@ -47,7 +60,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
-from mcp.server.auth.routes import build_resource_metadata_url
+from mcp.server.auth.routes import build_resource_metadata_url, create_protected_resource_routes
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -73,6 +86,10 @@ system_token_provider: SystemTokenProvider = SystemTokenProvider(configs)
 
 # Per-user FHIR sign-ins (FHIR_SERVER_AUTH_MODE=user_smart_login); replaced by configure_mcp_server().
 fhir_connect: FhirConnect = FhirConnect(configs)
+
+# Data access policy for signed-in users; replaced by configure_mcp_server().
+rules: Rules = Rules.from_configs(configs)
+access_resolver: AccessResolver = AccessResolver(rules)
 
 FHIR_CONNECT_MESSAGE = (
     "Connect your FHIR server account to continue. Sign in with the link, then retry the request."
@@ -126,6 +143,50 @@ async def get_async_fhir_client() -> AsyncFHIRClient:
     return await create_async_fhir_client(**client_kwargs)
 
 
+async def fetch_resource(resource_type: str, resource_id: str) -> Dict[str, Any] | None:
+    """Read one resource with the backend credential; None when it does not exist."""
+    client: AsyncFHIRClient = await get_async_fhir_client()
+    try:
+        return await client.resource(resource_type=resource_type, id=resource_id).execute(
+            operation="", method="GET"
+        )
+    except ResourceNotFound:
+        return None
+
+
+async def current_access() -> Access | None:
+    """
+    The signed-in caller's data access, or None when MCP authorization is off
+    (then there is no user to limit). With user_smart_login, a patient's own FHIR
+    sign-in names the patient they are limited to.
+    """
+    access_token: AccessToken | None = get_access_token()
+    if access_token is None:
+        return None
+    fhir_patient: str | None = None
+    if configs.effective_server_auth_mode == "user_smart_login" and access_token.subject:
+        fhir_patient = fhir_connect.user_patient(access_token.subject)
+    return await access_resolver.resolve(access_token.claims or {}, fetch_resource, fhir_patient)
+
+
+async def policy_outcome(access: Access | None, tool: str, resource_type: str, ex: PolicyDenied) -> Dict[str, Any]:
+    """A forbidden OperationOutcome for a request the access policy refused."""
+    if access is not None:
+        audit(access, tool, resource_type, "denied", str(ex))
+    else:
+        logger.info("Refused %s on %s: %s", tool, resource_type or "-", ex)
+    return await get_operation_outcome(code="forbidden", diagnostics=str(ex))
+
+
+async def check_read_only(tool: str) -> Dict[str, Any] | None:
+    """A forbidden OperationOutcome when FHIR_MCP_READ_ONLY turns off changes."""
+    if not rules.read_only:
+        return None
+    return await get_operation_outcome(
+        code="forbidden", diagnostics=f"This server is read-only; '{tool}' is turned off."
+    )
+
+
 async def check_tool_scope(tool: str) -> Dict[str, Any] | None:
     """
     Return a forbidden OperationOutcome if the caller's token lacks the tool's scope.
@@ -138,6 +199,11 @@ async def check_tool_scope(tool: str) -> Dict[str, Any] | None:
     required: str = tool_scopes(configs)[tool]
     if required in access_token.scopes:
         return None
+    if not can_gain_scope(access_token.claims or {}, rules):
+        logger.info("Refused %s: the account's role cannot be granted '%s'.", tool, required)
+        return await get_operation_outcome(
+            code="forbidden", diagnostics=f"Your account is not allowed to use '{tool}'."
+        )
     return await get_operation_outcome(
         code="forbidden",
         diagnostics=f"The access token does not grant the '{required}' scope required by '{tool}'.",
@@ -215,6 +281,9 @@ def configure_mcp_server() -> MCPServer:
     if configs.effective_server_auth_mode == "none":
         logger.warning("Requests to the FHIR server carry no credential (FHIR_SERVER_AUTH_MODE=none).")
     mcp: MCPServer = MCPServer(**mcp_kwargs)
+    global rules, access_resolver
+    rules = Rules.from_configs(configs)
+    access_resolver = AccessResolver(rules)
     if configs.effective_server_auth_mode == "user_smart_login":
         global fhir_connect
         fhir_connect = FhirConnect(configs)
@@ -242,6 +311,14 @@ def build_http_app(mcp: MCPServer) -> Starlette:
     """The Streamable HTTP application, with per-tool scope checks when auth is on."""
     app: Starlette = mcp.streamable_http_app(**http_transport_options("streamable-http"))
     if configs.mcp_auth_mode == "resource_server":
+        # Ahead of the SDK's metadata route, which advertises only the scope every tool
+        # requires. Clients request what is advertised, and the IdP grants what the user's
+        # role allows, so users who may write get those scopes at their first sign-in.
+        app.router.routes[:0] = create_protected_resource_routes(
+            resource_url=mcp.settings.auth.resource_server_url,
+            authorization_servers=[mcp.settings.auth.issuer_url],
+            scopes_supported=list(dict.fromkeys(tool_scopes(configs).values())),
+        )
         # Appended after the SDK's bearer authentication, so the token is already validated.
         app.user_middleware.append(
             Middleware(
@@ -250,6 +327,7 @@ def build_http_app(mcp: MCPServer) -> Starlette:
                 resource_metadata_url=str(
                     build_resource_metadata_url(AnyHttpUrl(configs.effective_resource_url))
                 ),
+                can_gain_scope=lambda claims: can_gain_scope(claims, rules),
             )
         )
     return app
@@ -385,6 +463,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
     ]:
         if outcome := await check_tool_access("search", ctx):
             return outcome
+        access: Access | None = None
         try:
             logger.debug(f"Invoked with type='{type}' and searchParam={searchParam}")
             if not type:
@@ -394,13 +473,21 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 return await get_operation_outcome_required_error("type")
             if outcome := await validate_resource_type(type):
                 return outcome
+            if access := await current_access():
+                searchParam = check_search(access, rules, type, searchParam)
 
             client: AsyncFHIRClient = await get_async_fhir_client()
             async_resources: list[Any] = (
                 await client.resources(type).search(Raw(**searchParam)).fetch_raw()
             )
             logger.debug("Async resources fetched: %s", async_resources)
+            if access:
+                # Before the field filter, which may remove the patient references.
+                async_resources = filter_result(access, rules, async_resources)
+                audit(access, "search", type, "allowed")
             return filter_response_fields(async_resources, response_filter_fhirpaths)
+        except PolicyDenied as ex:
+            return await policy_outcome(access, "search", type, ex)
         except ValueError as ex:
             logger.exception(
                 f"User does not have permission to perform FHIR '{type}' resource search operation. Caused by, ",
@@ -483,6 +570,7 @@ def register_mcp_tools(mcp: MCPServer) -> None:
     ]:
         if outcome := await check_tool_access("read", ctx):
             return outcome
+        access: Access | None = None
         try:
             logger.debug(
                 f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
@@ -494,6 +582,12 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 return await get_operation_outcome_required_error("type")
             if outcome := await validate_inputs(type, id, operation):
                 return outcome
+            if access := await current_access():
+                if id:
+                    check_blocked(access, rules, searchParam)
+                else:
+                    # Without an id this is a search, so it gets the same limits.
+                    searchParam = check_search(access, rules, type, searchParam)
 
             client: AsyncFHIRClient = await get_async_fhir_client()
             bundle: dict = await client.resource(resource_type=type, id=id).execute(
@@ -501,7 +595,19 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             )
 
             entries = await extract_bundle_resources(bundle=bundle)
+            if access:
+                entries = filter_result(access, rules, entries)
+                if entries is None:
+                    # Answered like a missing record, so other patients' IDs reveal nothing.
+                    audit(access, "read", type, "denied", "record of another patient")
+                    return await get_operation_outcome(
+                        code="not-found",
+                        diagnostics=f"The resource of type '{type}' with id '{id}' was not found.",
+                    )
+                audit(access, "read", type, "allowed")
             return filter_response_fields(entries, response_filter_fhirpaths)
+        except PolicyDenied as ex:
+            return await policy_outcome(access, "read", type, ex)
         except ResourceNotFound as ex:
             logger.error(
                 f"Resource of type '{type}' with id '{id}' not found. Caused by, ",
@@ -602,8 +708,9 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             )
         ),
     ]:
-        if outcome := await check_tool_access("create", ctx):
+        if outcome := await check_read_only("create") or await check_tool_access("create", ctx):
             return outcome
+        access: Access | None = None
         try:
             logger.debug(
                 f"Invoked with type='{type}', payload={payload}, searchParam={searchParam}, and operation={operation}"
@@ -615,6 +722,11 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 return await get_operation_outcome_required_error("type")
             if outcome := await validate_inputs(type, operation=operation):
                 return outcome
+            if access := await current_access():
+                check_write(
+                    access, rules, "create", {"resourceType": type, **payload},
+                    conditional=bool(searchParam), operation=operation,
+                )
 
             client: AsyncFHIRClient = await get_async_fhir_client()
             bundle: dict = await client.resource(resource_type=type).execute(
@@ -623,7 +735,10 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 params=searchParam,
             )
 
+            audit(access, "create", type, "allowed")
             return await extract_bundle_resources(bundle=bundle)
+        except PolicyDenied as ex:
+            return await policy_outcome(access, "create", type, ex)
         except ValueError as ex:
             logger.exception(
                 f"User does not have permission to perform FHIR '{type}' resource create operation. Caused by, ",
@@ -715,8 +830,9 @@ def register_mcp_tools(mcp: MCPServer) -> None:
         Dict[str, Any],
         Field(description="A dictionary containing the updated FHIR resource"),
     ]:
-        if outcome := await check_tool_access("update", ctx):
+        if outcome := await check_read_only("update") or await check_tool_access("update", ctx):
             return outcome
+        access: Access | None = None
         try:
             logger.debug(
                 f"Invoked with type='{type}', id={id}, payload={payload}, searchParam={searchParam}, and operation={operation}"
@@ -728,6 +844,15 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 return await get_operation_outcome_required_error("type")
             if outcome := await validate_inputs(type, id, operation):
                 return outcome
+            if (access := await current_access()) and access.restricted:
+                check_write(
+                    access, rules, "update", {"resourceType": type, **payload, "id": id},
+                    conditional=not id, operation=operation,
+                )
+                # The stored record must belong to the caller too, not only the new version.
+                existing = await fetch_resource(type, id)
+                if existing is not None and not allows(access, rules, existing):
+                    raise PolicyDenied("Your account can only create or change its own records.")
 
             client: AsyncFHIRClient = await get_async_fhir_client()
             bundle: dict = await client.resource(resource_type=type, id=id).execute(
@@ -736,7 +861,10 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 data={"resourceType": type, **payload, "id": id},
                 params=searchParam,
             )
+            audit(access, "update", type, "allowed")
             return await extract_bundle_resources(bundle=bundle)
+        except PolicyDenied as ex:
+            return await policy_outcome(access, "update", type, ex)
         except ValueError as ex:
             logger.exception(
                 f"User does not have permission to perform FHIR '{type}' resource update operation. Caused by, ",
@@ -809,8 +937,9 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             description="A dictionary containing the confirmation of deletion or details on why deletion failed."
         ),
     ]:
-        if outcome := await check_tool_access("delete", ctx):
+        if outcome := await check_read_only("delete") or await check_tool_access("delete", ctx):
             return outcome
+        access: Access | None = None
         try:
             logger.debug(
                 f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
@@ -828,10 +957,14 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 )
                 return await get_operation_outcome_required_error("id")
 
+            if access := await current_access():
+                check_write(access, rules, "delete", {"resourceType": type, "id": id})
+
             client: AsyncFHIRClient = await get_async_fhir_client()
             bundle = await client.resource(resource_type=type, id=id).execute(
                 operation=operation or "", method="DELETE", params=searchParam
             )
+            audit(access, "delete", type, "allowed")
             if isinstance(bundle, Dict):
                 return await extract_bundle_resources(bundle=bundle)
             return await get_operation_outcome(
@@ -839,6 +972,8 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 code="SUCCESSFUL_DELETE",
                 diagnostics="Successfully deleted resource(s).",
             )
+        except PolicyDenied as ex:
+            return await policy_outcome(access, "delete", type, ex)
         except ValueError as ex:
             logger.exception(
                 f"User does not have permission to perform FHIR '{type}' resource delete operation. Caused by, ",
