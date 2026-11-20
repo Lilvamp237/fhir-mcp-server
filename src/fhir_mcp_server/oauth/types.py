@@ -1,4 +1,4 @@
-# Copyright (c) 2025, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
+# Copyright (c) 2025-2026, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
 
 # WSO2 LLC. licenses this file to you under the Apache License,
 # Version 2.0 (the "License"); you may not use this file except
@@ -14,15 +14,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import base64
-import json
 import logging
 
-from typing import Any, Dict
-from pydantic import AnyHttpUrl, BaseModel
+from typing import Literal
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigurationError(ValueError):
+    """Raised at startup when the server's settings are invalid or outdated."""
+
+
+def _split(value: str) -> list[str]:
+    """Split a space- or comma-separated setting into its non-empty items."""
+    return [item for item in value.replace(",", " ").split() if item]
 
 
 class ServerConfigs(BaseSettings):
@@ -41,23 +48,39 @@ class ServerConfigs(BaseSettings):
     mcp_port: int = 8000
     mcp_server_url: str | None = None
     mcp_request_timeout: int = 30  # in secs
+    mcp_allowed_hosts: str = ""
+    mcp_allowed_origins: str = ""
+    mcp_max_request_body_bytes: int | None = None
+
+    # MCP authorization: the MCP server is an OAuth resource server.
+    mcp_auth_mode: Literal["resource_server", "disabled"] = "resource_server"
+    mcp_idp_issuer: str = ""
+    mcp_idp_ca_cert: str | None = None  # CA bundle for an IdP with a self-signed certificate
+    mcp_resource_url: str | None = None  # canonical MCP endpoint URL and expected token audience
+    mcp_jwks_uri: str | None = None  # defaults to the IdP's discovered jwks_uri
+    mcp_read_scope: str = "fhir-read"
+    mcp_write_scope: str = "fhir-write"
+    mcp_delete_scope: str = "fhir-delete"
+    # Where per-user FHIR tokens and pending sign-ins are kept: "memory" (default, lost on
+    # restart) or "module:function" returning a custom store (see fhir_mcp_server.token_store).
+    mcp_token_store: str = "memory"
 
     # FHIR settings
+    server_base_url: str = ""
+    # none: no credential (open or local FHIR server)
+    # token_exchange: exchange the caller's MCP token at the same IdP (RFC 8693)
+    # user_smart_login: each user signs in at the FHIR server (SMART App Launch); the IdP
+    #   federates to the FHIR server, and the FHIR sign-in must match the MCP token's fhirUser
+    server_auth_mode: Literal["none", "token_exchange", "user_smart_login"] = "none"
+    server_authorize_url: str | None = None  # user_smart_login; defaults to the FHIR server's SMART configuration
+    server_token_url: str | None = None
+    server_token_resource: str | None = None  # token_exchange: the FHIR API's audience
     server_client_id: str = ""
     server_client_secret: str = ""
     server_scopes: str = ""
-    server_base_url: str = ""
-    server_access_token: str | None = None
-    server_disable_authorization: bool = False
+    server_ca_cert: str | None = None
 
-    def callback_url(
-        self, server_url: str, suffix: str = "/oauth/callback"
-    ) -> AnyHttpUrl:
-        return AnyHttpUrl(f"{server_url.rstrip('/')}{suffix}")
-
-    @property
-    def discovery_url(self) -> str:
-        return f"{self.server_base_url.rstrip('/')}/.well-known/smart-configuration"
+    server_disable_authorization: str | None = None
 
     @property
     def metadata_url(self) -> str:
@@ -65,95 +88,79 @@ class ServerConfigs(BaseSettings):
 
     @property
     def scopes(self) -> list[str]:
-        # If the raw value is a string, split on empty spaces
-        if isinstance(self.server_scopes, str):
-            return [
-                scope.strip()
-                for scope in self.server_scopes.split(" ")
-                if scope.strip()
-            ]
-        return [self.server_scopes]
+        return _split(self.server_scopes)
 
     @property
     def effective_server_url(self) -> str:
         return self.mcp_server_url or f"http://{self.mcp_host}:{self.mcp_port}"
 
-    def __init__(self, **data):
-        """Initialize settings with values from environment variables"""
-        super().__init__(**data)
-
-
-class OAuthMetadata(BaseModel):
-    """
-    OAuth 2.0 Authorization Server Metadata.
-    """
-
-    issuer: AnyHttpUrl
-    authorization_endpoint: AnyHttpUrl
-    token_endpoint: AnyHttpUrl
-    registration_endpoint: AnyHttpUrl | None = None
-    scopes_supported: list[str] | None = None
-    response_types_supported: list[str]
-    response_modes_supported: list[str] | None = None
-    grant_types_supported: list[str] | None = None
-    token_endpoint_auth_methods_supported: list[str] | None = None
-    token_endpoint_auth_signing_alg_values_supported: list[str] | None = None
-    service_documentation: AnyHttpUrl | None = None
-    ui_locales_supported: list[str] | None = None
-    op_policy_uri: AnyHttpUrl | None = None
-    op_tos_uri: AnyHttpUrl | None = None
-    revocation_endpoint: AnyHttpUrl | None = None
-    revocation_endpoint_auth_methods_supported: list[str] | None = None
-    revocation_endpoint_auth_signing_alg_values_supported: None = None
-    introspection_endpoint: AnyHttpUrl | None = None
-    introspection_endpoint_auth_methods_supported: list[str] | None = None
-    introspection_endpoint_auth_signing_alg_values_supported: None = None
-    code_challenge_methods_supported: list[str] | None = None
-
-
-class OAuthToken(BaseModel):
-    """
-    OAuth 2.0 token with metadata.
-    """
-
-    access_token: str
-    token_type: str
-    expires_in: int | None = None
-    scope: str | None = None
-    refresh_token: str | None = None
-    expires_at: float | None = None
-    id_token: str | None = None
-    client_id: str | None = None
+    @property
+    def effective_resource_url(self) -> str:
+        """The canonical URL of the MCP endpoint; tokens must be issued for it."""
+        return (self.mcp_resource_url or f"{self.effective_server_url.rstrip('/')}/mcp").rstrip("/")
 
     @property
-    def scopes(self) -> list[str]:
-        return self.scope.split(" ") if self.scope else []
+    def effective_server_auth_mode(self) -> str:
+        return self.server_auth_mode
 
-    def get_id_token(self) -> "IDToken | None":
-        """
-        Parse the id_token and return an IDToken object.
+    @property
+    def allowed_hosts(self) -> list[str]:
+        return _split(self.mcp_allowed_hosts)
 
-        Returns:
-            An IDToken instance populated from the JWT payload or None if parsing fails.
-        """
-        payload: Dict[str, Any] | None = (
-            decode_jws(self.id_token) if self.id_token else None
-        )
-        if not payload:
-            return None
+    @property
+    def allowed_origins(self) -> list[str]:
+        return _split(self.mcp_allowed_origins)
 
-        return IDToken.model_validate(payload)
+    def validate_for_startup(self) -> None:
+        """Reject removed settings and incomplete configurations with a clear message."""
+        if self.mcp_token_store.strip() != "memory":
+            from fhir_mcp_server.token_store import store_factory  # avoids a circular import
 
-
-class AuthorizationCode(BaseModel):
-    code: str
-    scopes: list[str]
-    expires_at: float
-    client_id: str
-    code_verifier: str
-    code_challenge: str
-    redirect_uri: AnyHttpUrl
-    redirect_uri_provided_explicitly: bool
+            store_factory(self.mcp_token_store.strip())  # raises ConfigurationError if it cannot load
+        if self.server_disable_authorization is not None:
+            raise ConfigurationError(
+                "FHIR_SERVER_DISABLE_AUTHORIZATION is no longer supported. Use "
+                "FHIR_MCP_AUTH_MODE=disabled (MCP login) and FHIR_SERVER_AUTH_MODE "
+                "(how the server calls the FHIR server) instead."
+            )
+        if self.mcp_auth_mode == "resource_server":
+            if not self.mcp_idp_issuer:
+                raise ConfigurationError(
+                    "FHIR_MCP_IDP_ISSUER is required when FHIR_MCP_AUTH_MODE=resource_server. "
+                    "Set it to your identity provider's issuer URL, or set FHIR_MCP_AUTH_MODE=disabled "
+                    "for local development."
+                )
+        mode = self.effective_server_auth_mode
+        if mode == "user_smart_login":
+            if self.mcp_auth_mode != "resource_server":
+                raise ConfigurationError(
+                    "FHIR_SERVER_AUTH_MODE=user_smart_login needs FHIR_MCP_AUTH_MODE=resource_server, "
+                    "because each user's FHIR sign-in is tied to their MCP login."
+                )
+            if "openid" not in self.scopes:
+                raise ConfigurationError(
+                    "FHIR_SERVER_AUTH_MODE=user_smart_login needs `openid fhirUser` in FHIR_SERVER_SCOPES, "
+                    "so the FHIR server says who signed in."
+                )
+        if mode == "token_exchange":
+            if self.mcp_auth_mode != "resource_server":
+                raise ConfigurationError(
+                    "FHIR_SERVER_AUTH_MODE=token_exchange needs FHIR_MCP_AUTH_MODE=resource_server: "
+                    "it exchanges the caller's MCP access token at the IdP that issued it."
+                )
+            if not self.server_token_resource:
+                raise ConfigurationError(
+                    "FHIR_SERVER_TOKEN_RESOURCE is required when FHIR_SERVER_AUTH_MODE=token_exchange: "
+                    "the FHIR API's audience to exchange the MCP token for."
+                )
+        if mode in ("token_exchange", "user_smart_login") and not self.server_client_id:
+            raise ConfigurationError(
+                f"FHIR_SERVER_CLIENT_ID is required when FHIR_SERVER_AUTH_MODE={mode}."
+            )
+        if mode == "token_exchange" and not self.server_client_secret:
+            raise ConfigurationError(
+                "FHIR_SERVER_CLIENT_SECRET is required when FHIR_SERVER_AUTH_MODE=token_exchange."
+            )
 
 
 class IDToken(BaseModel):
@@ -192,27 +199,3 @@ class IDToken(BaseModel):
         """Get the FHIR resource ID from fhirUser URL."""
         parsed = self.parse_fhir_user()
         return parsed[1] if parsed else None
-
-
-def decode_jws(jws: str) -> Dict[str, Any] | None:
-    """
-    Decode the provided JWS payload.
-
-    Returns:
-        The decoded JWS payload as a dictionary.
-    """
-    try:
-        parts: list[str] = jws.split(".")
-        if len(parts) != 3:
-            logger.debug(
-                f"Decoding JWS failed: Invalid JWS format, expected 3 parts but got {len(parts)}: {jws}"
-            )
-            return None
-
-        padded: str = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        decoded: bytes = base64.urlsafe_b64decode(padded)
-        return json.loads(decoded)
-
-    except Exception as e:
-        logger.exception("Error decoding JWS token. Caused by, ", exc_info=e)
-        return None

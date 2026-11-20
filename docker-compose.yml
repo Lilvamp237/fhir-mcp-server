@@ -36,7 +36,7 @@ services:
       FHIR_MCP_HOST: 0.0.0.0
       FHIR_MCP_PORT: "8000"
       FHIR_MCP_REQUEST_TIMEOUT: "30"
-      FHIR_SERVER_DISABLE_AUTHORIZATION: True
+      FHIR_MCP_AUTH_MODE: disabled
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

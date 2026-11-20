@@ -17,7 +17,6 @@
 import click
 import logging
 
-from importlib.metadata import version as package_version
 
 from fhir_mcp_server.field_filter import filter_response_fields
 from fhir_mcp_server.utils import (
@@ -33,156 +32,268 @@ from fhir_mcp_server.utils import (
     validate_resource_type,
     validate_inputs,
 )
-from fhir_mcp_server.oauth import (
-    handle_failed_authentication,
-    OAuthServerProvider,
-    OAuthToken,
-    ServerConfigs,
-)
+from fhir_mcp_server.auth import ScopeChallengeMiddleware, ToolScopeMiddleware, create_token_verifier, tool_scopes
+from fhir_mcp_server.backend_auth import BackendAuthError, TokenExchangeProvider
+from fhir_mcp_server.fhir_connect import FhirConnect
+from fhir_mcp_server.oauth import IDToken, ServerConfigs
+from fhir_mcp_server.oauth.types import ConfigurationError
 from fhirpy import AsyncFHIRClient
-from fhirpy.lib import AsyncFHIRResource
 from fhirpy.base.exceptions import OperationOutcome, ResourceNotFound
 from fhirpy.base.searchset import Raw
 from typing import Dict, Any, List
 from typing_extensions import Annotated
 from pydantic import AnyHttpUrl, Field
-from starlette.requests import Request
-from starlette.responses import RedirectResponse, Response
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
-from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
-from mcp.server.fastmcp.server import FastMCP
+from mcp.server.auth.routes import build_resource_metadata_url, create_protected_resource_routes
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.exceptions import UrlElicitationRequiredError
+from mcp_types import ElicitRequest, ElicitRequestURLParams, ElicitResult, InputRequiredResult
+from mcp_types.version import is_version_at_least
+from importlib.metadata import PackageNotFoundError, version
+
+import secrets
+
+import uvicorn
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+try:
+    SERVER_VERSION: str = version("fhir-mcp-server")
+except PackageNotFoundError:
+    SERVER_VERSION = "0.0.0"
+
 configs: ServerConfigs = ServerConfigs()
 
-server_provider: OAuthServerProvider = OAuthServerProvider(configs=configs)
+token_exchange_provider: TokenExchangeProvider = TokenExchangeProvider(configs)
+
+# Per-user FHIR sign-ins (FHIR_SERVER_AUTH_MODE=user_smart_login); replaced by configure_mcp_server().
+fhir_connect: FhirConnect = FhirConnect(configs)
+
+FHIR_CONNECT_MESSAGE = (
+    "Connect your FHIR server account to continue. Sign in with the link, then retry the request."
+)
+FHIR_CONNECT_DECLINED_MESSAGE = (
+    "The user declined to connect their FHIR server account, so this request was not run. "
+    "Tell the user they declined and that they can ask to try again. "
+    "Do not call FHIR tools again unless the user asks to."
+)
+FHIR_CONNECT_INPUT = "fhir-connect"  # key of the connect link in InputRequiredResult.inputRequests
 
 
-async def get_user_access_token() -> OAuthToken | None:
+async def get_backend_access_token() -> str | None:
     """
-    Retrieve the access token for the authenticated user.
-    Returns an OAuthToken if available, otherwise raises an error.
+    The credential sent to the FHIR server, chosen by FHIR_SERVER_AUTH_MODE.
+    The MCP access token is never forwarded to the FHIR server.
     """
-    if configs.server_access_token:
-        logger.debug("Using configured FHIR access token for user.")
-        return OAuthToken(
-            access_token=configs.server_access_token,
-            token_type="Bearer",
-            client_id=configs.server_client_id,
+    mode: str = configs.effective_server_auth_mode
+    if mode == "token_exchange":
+        access_token: AccessToken | None = get_access_token()
+        if access_token is None:
+            raise BackendAuthError("Token exchange requires a validated MCP access token.")
+        return await token_exchange_provider.exchange(access_token.token, access_token.subject)
+    if mode == "user_smart_login":
+        access_token: AccessToken | None = get_access_token()
+        token = (
+            await fhir_connect.user_token(access_token.subject, access_token.client_id)
+            if access_token and access_token.subject
+            else None
         )
+        if token is None:
+            raise BackendAuthError("The user has not connected their FHIR server account.")
+        return token
+    return None
 
-    user_token: AccessToken | None = get_access_token()
-    logger.debug("Obtained client access token from context.")
 
-    # Return the FHIR access token
-    return (
-        OAuthToken(
-            access_token=user_token.token,
-            client_id=configs.server_client_id,
-            token_type="Bearer",
-            expires_at=user_token.expires_at,
-            scope=" ".join(user_token.scopes),
-        )
-        if user_token
-        else None
-    )
+async def get_metadata_access_token() -> str | None:
+    """
+    The credential for the metadata endpoint. A per-user server's metadata is public
+    (SMART), so a user who has not connected yet reads it without a token.
+    """
+    if configs.effective_server_auth_mode == "user_smart_login":
+        try:
+            return await get_backend_access_token()
+        except BackendAuthError:
+            return None
+    return await get_backend_access_token()
 
 
 async def get_async_fhir_client() -> AsyncFHIRClient:
     """
-    Get an async FHIR client with the user's access token.
+    Get an async FHIR client that authenticates with the backend credential.
     Returns an AsyncFHIRClient instance.
     """
     client_kwargs: Dict = {
         "config": configs,
         "extra_headers": get_default_headers(),
     }
-
-    user_token: OAuthToken | None = await get_user_access_token()
-    disable_auth: bool = configs.server_disable_authorization
-    if not user_token:
-        if not disable_auth:
-            logger.error("User is not authenticated.")
-            raise ValueError("User is not authenticated.")
-    else:
-        client_kwargs["access_token"] = user_token.access_token
-
+    access_token: str | None = await get_backend_access_token()
+    if access_token:
+        client_kwargs["access_token"] = access_token
     return await create_async_fhir_client(**client_kwargs)
 
 
-def configure_mcp_server() -> FastMCP:
+async def check_tool_scope(tool: str) -> Dict[str, Any] | None:
     """
-    Configure and instantiate the FastMCP server instance.
-    If disable_auth is True, the server will be started without authorization.
-    Returns a FastMCP instance.
+    Return a forbidden OperationOutcome if the caller's token lacks the tool's scope.
+    Over Streamable HTTP the same check answers HTTP 403 before the tool runs; this
+    covers the other transports. Returns None when authorization is disabled.
     """
-    fastmcp_kwargs: Dict = {
-        "name": "FHIR MCP Server",
-        "instructions": "This server implements the HL7 FHIR MCP for secure, standards-based access to FHIR resources",
-        "host": configs.mcp_host,
-        "port": configs.mcp_port,
-        "json_response": True,
-        "stateless_http": True,
-    }
-    disable_auth = configs.server_disable_authorization
-    if not disable_auth:
-        logger.debug("Enabling authorization for FHIR MCP server.")
-        auth_settings: AuthSettings = AuthSettings(
-            issuer_url=AnyHttpUrl(configs.effective_server_url),
-            resource_server_url=AnyHttpUrl(configs.effective_server_url),
-            client_registration_options=ClientRegistrationOptions(
-                enabled=True,
-                valid_scopes=configs.scopes,
-                default_scopes=configs.scopes,
-            ),
+    access_token: AccessToken | None = get_access_token()
+    if access_token is None:
+        return None
+    required: str = tool_scopes(configs)[tool]
+    if required in access_token.scopes:
+        return None
+    return await get_operation_outcome(
+        code="forbidden",
+        diagnostics=f"The access token does not grant the '{required}' scope required by '{tool}'.",
+    )
+
+
+async def check_tool_access(tool: str, ctx: Context) -> Dict[str, Any] | InputRequiredResult | None:
+    """
+    The tool's scope check, then, with FHIR_SERVER_AUTH_MODE=user_smart_login, whether
+    the user has connected their FHIR server account on this MCP client. If not, the
+    client is asked to open a sign-in link (URL-mode elicitation): an
+    `InputRequiredResult` on 2026-07-28, a URL elicitation error on earlier protocol
+    versions, and the link as text to clients that have not declared URL elicitation.
+    Returns None when the tool may run.
+    """
+    if outcome := await check_tool_scope(tool):
+        return outcome
+    if configs.effective_server_auth_mode != "user_smart_login":
+        return None
+    access_token: AccessToken | None = get_access_token()
+    if access_token is None or not access_token.subject:
+        return None
+    sub, client_id = access_token.subject, access_token.client_id
+    if await fhir_connect.user_token(sub, client_id):
+        return None
+
+    answer = (ctx.input_responses or {}).get(FHIR_CONNECT_INPUT)
+    action = answer.action if isinstance(answer, ElicitResult) else (answer or {}).get("action") if isinstance(answer, dict) else None
+    if action in ("decline", "cancel"):
+        # The user turned the link down: stop asking on this request and withdraw the link.
+        await fhir_connect.cancel_link(sub, client_id)
+        logger.info("A user %s the FHIR sign-in link.", "declined" if action == "decline" else "cancelled")
+        return await get_operation_outcome(code="login", diagnostics=FHIR_CONNECT_DECLINED_MESSAGE)
+
+    link: str = await fhir_connect.connect_link(sub, client_id, (access_token.claims or {}).get("fhirUser"))
+    capabilities = ctx.client_capabilities
+    supports_url = bool(capabilities and capabilities.elicitation and capabilities.elicitation.url)
+    if not supports_url:
+        # No declared URL elicitation support (including earlier-protocol requests to this
+        # stateless endpoint, which carry no capabilities): never send an elicitation
+        # mode the client has not declared, so give the link as text instead.
+        return await get_operation_outcome(code="login", diagnostics=f"{FHIR_CONNECT_MESSAGE} {link}")
+    if is_version_at_least(ctx.protocol_version or "", "2026-07-28"):
+        return InputRequiredResult(
+            input_requests={
+                FHIR_CONNECT_INPUT: ElicitRequest(params=ElicitRequestURLParams(message=FHIR_CONNECT_MESSAGE, url=link))
+            }
         )
-        fastmcp_kwargs["auth_server_provider"] = server_provider
-        fastmcp_kwargs["auth"] = auth_settings
+    # An earlier-protocol client that declared URL elicitation: the URL elicitation error (-32042).
+    raise UrlElicitationRequiredError(
+        [ElicitRequestURLParams(message=FHIR_CONNECT_MESSAGE, url=link, elicitation_id=secrets.token_urlsafe(16))],
+        message=f"{FHIR_CONNECT_MESSAGE} {link}",
+    )
+
+
+def configure_mcp_server() -> MCPServer:
+    """
+    Configure and instantiate the MCPServer instance.
+    With FHIR_MCP_AUTH_MODE=resource_server, every request needs an access token
+    issued by the configured IdP for this server's MCP endpoint.
+    Transport options are applied when the server is run; see `http_transport_options`.
+    Returns an MCPServer instance.
+    """
+    mcp_kwargs: Dict = {
+        "name": "FHIR MCP Server",
+        "version": SERVER_VERSION,
+        "instructions": "This server implements the HL7 FHIR MCP for secure, standards-based access to FHIR resources",
+    }
+    if configs.mcp_auth_mode == "resource_server":
+        logger.debug("Validating MCP access tokens issued by %s.", configs.mcp_idp_issuer)
+        # Passed as strings so the issuer and resource keep their exact spelling
+        # (no added trailing slash); RFC 8414/9207 issuer comparison is exact.
+        mcp_kwargs["auth"] = AuthSettings(
+            issuer_url=configs.mcp_idp_issuer,
+            resource_server_url=configs.effective_resource_url,
+            # Every tool needs at least the read scope; write and delete scopes are
+            # checked per tool (see ToolScopeMiddleware).
+            required_scopes=[configs.mcp_read_scope],
+            validate_token_resource=True,
+        )
+        mcp_kwargs["token_verifier"] = create_token_verifier(configs)
     else:
-        logger.warning("MCP authentication is disabled.")
-    mcp: FastMCP = FastMCP(**fastmcp_kwargs)
-    # FastMCP does not accept a version, so the low-level server would otherwise
-    # report the MCP SDK version in serverInfo.
-    mcp._mcp_server.version = package_version("fhir-mcp-server")
+        logger.warning("MCP authorization is disabled.")
+    if configs.effective_server_auth_mode == "none":
+        logger.warning("Requests to the FHIR server carry no credential (FHIR_SERVER_AUTH_MODE=none).")
+    mcp: MCPServer = MCPServer(**mcp_kwargs)
+    if configs.effective_server_auth_mode == "user_smart_login":
+        global fhir_connect
+        fhir_connect = FhirConnect(configs)
+        fhir_connect.register_routes(mcp)
     return mcp
 
 
-def register_mcp_routes(
-    mcp: FastMCP,
-    server_provider: OAuthServerProvider,
-) -> None:
-    """
-    Register custom routes for the FastMCP server instance.
-    """
-    logger.debug("Registering custom MCP routes.")
+def http_transport_options(transport: str) -> Dict[str, Any]:
+    """Options for `MCPServer.run()` and `streamable_http_app()` on HTTP transports."""
+    options: Dict[str, Any] = {"host": configs.mcp_host}
+    if configs.allowed_hosts:
+        options["transport_security"] = TransportSecuritySettings(
+            allowed_hosts=configs.allowed_hosts,
+            allowed_origins=configs.allowed_origins,
+        )
+    if configs.mcp_max_request_body_bytes:
+        options["max_request_body_size"] = configs.mcp_max_request_body_bytes
+    if transport == "streamable-http":
+        options["json_response"] = True
+        options["stateless_http"] = True
+    return options
 
-    @mcp.custom_route("/oauth/callback", methods=["GET"])
-    async def handle_auth_server_callback(request: Request) -> Response:
-        """Handle MCP OAuth redirect."""
-        code: str | None = request.query_params.get("code")
-        state: str | None = request.query_params.get("state")
 
-        if not code or not state:
-            return handle_failed_authentication("Missing code or state parameter")
-
-        try:
-            redirect_uri: str = await server_provider.handle_mcp_oauth_callback(
-                code, state
+def build_http_app(mcp: MCPServer) -> Starlette:
+    """The Streamable HTTP application, with per-tool scope checks when auth is on."""
+    app: Starlette = mcp.streamable_http_app(**http_transport_options("streamable-http"))
+    if configs.mcp_auth_mode == "resource_server":
+        # Ahead of the SDK's metadata route, which advertises only the scope every tool
+        # requires. Clients request what is advertised, and the IdP grants what the user's
+        # role allows, so users who may write get those scopes at their first sign-in.
+        app.router.routes[:0] = create_protected_resource_routes(
+            resource_url=mcp.settings.auth.resource_server_url,
+            authorization_servers=[mcp.settings.auth.issuer_url],
+            scopes_supported=list(dict.fromkeys(tool_scopes(configs).values())),
+        )
+        # Appended after the SDK's bearer authentication, so the token is already validated.
+        app.user_middleware.append(
+            Middleware(
+                ToolScopeMiddleware,
+                scopes=tool_scopes(configs),
+                resource_metadata_url=str(
+                    build_resource_metadata_url(AnyHttpUrl(configs.effective_resource_url))
+                ),
             )
-            return RedirectResponse(status_code=302, url=redirect_uri)
-        except Exception as ex:
-            logger.error(
-                "Error occurred while handling MCP oauth callback. Caused by, ",
-                exc_info=ex,
-            )
-            return handle_failed_authentication("Something went wrong.")
+        )
+        # Outermost, so the SDK's 401 challenge names the scopes to request.
+        app.user_middleware.insert(
+            0,
+            Middleware(
+                ScopeChallengeMiddleware,
+                scopes=" ".join(dict.fromkeys(tool_scopes(configs).values())),
+            ),
+        )
+    return app
 
 
-def register_mcp_tools(mcp: FastMCP) -> None:
+def register_mcp_tools(mcp: MCPServer) -> None:
     """
-    Register tool functions for the FastMCP server instance.
+    Register tool functions for the MCPServer instance.
     """
     logger.debug("Registering MCP tools.")
 
@@ -221,11 +332,15 @@ def register_mcp_tools(mcp: FastMCP) -> None:
             )
         ),
     ]:
+        if outcome := await check_tool_scope("get_capabilities"):
+            return outcome
         try:
             logger.debug(f"Invoked with resource_type='{type}'")
             if outcome := await validate_resource_type(type):
                 return outcome
-            data: Dict[str, Any] = await get_capability_statement(configs.metadata_url)
+            data: Dict[str, Any] = await get_capability_statement(
+                configs.metadata_url, await get_metadata_access_token()
+            )
             for resource in data["rest"][0]["resource"]:
                 if resource.get("type") == type:
                     logger.info(
@@ -264,6 +379,7 @@ def register_mcp_tools(mcp: FastMCP) -> None:
         )
     )
     async def search(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -303,6 +419,8 @@ def register_mcp_tools(mcp: FastMCP) -> None:
             description="A dictionary containing the full FHIR resource instance matching the search criteria."
         ),
     ]:
+        if outcome := await check_tool_access("search", ctx):
+            return outcome
         try:
             logger.debug(f"Invoked with type='{type}' and searchParam={searchParam}")
             if not type:
@@ -351,6 +469,7 @@ def register_mcp_tools(mcp: FastMCP) -> None:
         )
     )
     async def read(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -398,6 +517,8 @@ def register_mcp_tools(mcp: FastMCP) -> None:
             description="A dictionary containing the single FHIR resource instance of the requested type and id."
         ),
     ]:
+        if outcome := await check_tool_access("read", ctx):
+            return outcome
         try:
             logger.debug(
                 f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
@@ -461,6 +582,7 @@ def register_mcp_tools(mcp: FastMCP) -> None:
         )
     )
     async def create(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -516,6 +638,8 @@ def register_mcp_tools(mcp: FastMCP) -> None:
             )
         ),
     ]:
+        if outcome := await check_tool_access("create", ctx):
+            return outcome
         try:
             logger.debug(
                 f"Invoked with type='{type}', payload={payload}, searchParam={searchParam}, and operation={operation}"
@@ -534,7 +658,6 @@ def register_mcp_tools(mcp: FastMCP) -> None:
                 data={"resourceType": type, **payload},
                 params=searchParam,
             )
-
             return await extract_bundle_resources(bundle=bundle)
         except ValueError as ex:
             logger.exception(
@@ -570,6 +693,7 @@ def register_mcp_tools(mcp: FastMCP) -> None:
         )
     )
     async def update(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -626,6 +750,8 @@ def register_mcp_tools(mcp: FastMCP) -> None:
         Dict[str, Any],
         Field(description="A dictionary containing the updated FHIR resource"),
     ]:
+        if outcome := await check_tool_access("update", ctx):
+            return outcome
         try:
             logger.debug(
                 f"Invoked with type='{type}', id={id}, payload={payload}, searchParam={searchParam}, and operation={operation}"
@@ -679,6 +805,7 @@ def register_mcp_tools(mcp: FastMCP) -> None:
         )
     )
     async def delete(
+        ctx: Context,
         type: Annotated[
             str,
             Field(
@@ -717,6 +844,8 @@ def register_mcp_tools(mcp: FastMCP) -> None:
             description="A dictionary containing the confirmation of deletion or details on why deletion failed."
         ),
     ]:
+        if outcome := await check_tool_access("delete", ctx):
+            return outcome
         try:
             logger.debug(
                 f"Invoked with type='{type}', id={id}, searchParam={searchParam}, and operation={operation}"
@@ -773,42 +902,40 @@ def register_mcp_tools(mcp: FastMCP) -> None:
             "Use this tool when you need to access the current user's demographic and contact details."
         )
     )
-    async def get_user() -> Annotated[
+    async def get_user(ctx: Context) -> Annotated[
         list[Dict[str, Any]] | Dict[str, Any],
         Field(
             description="A dictionary containing the authenticated user's demographic information such as 'id', 'name', and 'birthDate'."
         ),
     ]:
+        if outcome := await check_tool_access("get_user", ctx):
+            return outcome
         try:
             logger.debug("Retrieving authenticated user's profile.")
 
-            # Validate user authentication
-            user_token = await get_user_access_token()
-            if not user_token:
-                logger.debug("Unauthorized access attempt to get_me endpoint.")
+            # The validated access token identifies the user's FHIR resource
+            access_token: AccessToken | None = get_access_token()
+            if not access_token:
+                logger.debug("Unauthorized access attempt to get_user.")
                 return {}
 
-            # Retrieve token metadata
-            token_metadata = server_provider.token_metadata_mapping.get(
-                user_token.access_token
-            )
-            if not token_metadata:
-                logger.debug("Token metadata not found for authenticated user.")
-                return {}
-
-            # Extract ID token information
-            id_token = token_metadata.get_id_token()
-            if not id_token:
-                logger.debug("ID token not found in token metadata.")
-                return {}
-
-            # Validate resource identifiers
-            resource_id = id_token.resource_id
-            resource_type = id_token.resource_type
+            # With user_smart_login, the patient the user's own FHIR sign-in returned comes
+            # first, so an IdP account needs no fhirUser claim (for example a self-registered one).
+            fhir_patient: str | None = None
+            if configs.effective_server_auth_mode == "user_smart_login" and access_token.subject:
+                fhir_patient = await fhir_connect.user_patient(access_token.subject, access_token.client_id)
+            if fhir_patient:
+                resource_type, resource_id = "Patient", fhir_patient
+            else:
+                fhir_user = IDToken(fhirUser=(access_token.claims or {}).get("fhirUser"))
+                resource_id = fhir_user.resource_id
+                resource_type = fhir_user.resource_type
 
             if not resource_id or not resource_type:
-                logger.debug("Resource ID or type missing from ID token.")
+                logger.debug("Neither the FHIR sign-in nor the access token names the user's FHIR record.")
                 return {}
+            if outcome := await validate_inputs(resource_type, resource_id):
+                return outcome
 
             logger.debug(f"Fetching FHIR resource: {resource_type}/{resource_id}")
 
@@ -876,14 +1003,37 @@ def main(transport, log_level) -> int:
         format="[%(asctime)s] %(levelname)s {%(name)s.%(funcName)s:%(lineno)d} - %(message)s",
     )
     try:
-        mcp: FastMCP = configure_mcp_server()
+        if transport == "stdio" and configs.mcp_auth_mode != "disabled":
+            # The MCP authorization flow is for HTTP transports; stdio relies on the
+            # local process boundary and takes its FHIR credential from the environment.
+            logger.info("MCP authorization does not apply to the stdio transport.")
+            configs.mcp_auth_mode = "disabled"
+        configs.validate_for_startup()
+        mcp: MCPServer = configure_mcp_server()
         register_mcp_tools(mcp=mcp)
-        register_mcp_routes(mcp=mcp, server_provider=server_provider)
         logger.info(f"Starting FHIR MCP server with {transport} transport")
-        mcp.run(transport=transport)
+        if transport == "stdio":
+            mcp.run(transport=transport)
+        elif transport == "streamable-http":
+            uvicorn.run(
+                build_http_app(mcp),
+                host=configs.mcp_host,
+                port=configs.mcp_port,
+                log_level=log_level.lower().replace("warn", "warning"),
+            )
+        else:
+            mcp.run(
+                transport=transport,
+                port=configs.mcp_port,
+                **http_transport_options(transport),
+            )
+    except ConfigurationError as ex:
+        logger.error("Invalid configuration: %s", ex)
+        return 1
     except Exception as ex:
         logger.error(
             "Unable to run the FHIR MCP server. Caused by, %s", ex, exc_info=True
         )
         return 1
     return 0
+

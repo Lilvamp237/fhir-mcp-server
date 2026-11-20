@@ -1,4 +1,4 @@
-# Copyright (c) 2025, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
+# Copyright (c) 2025-2026, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
 
 # WSO2 LLC. licenses this file to you under the Apache License,
 # Version 2.0 (the "License"); you may not use this file except
@@ -17,12 +17,9 @@
 import pytest
 import os
 from unittest.mock import patch
-from pydantic import AnyHttpUrl, ValidationError
 from fhir_mcp_server.oauth.types import (
+    ConfigurationError,
     ServerConfigs,
-    OAuthMetadata,
-    OAuthToken,
-    AuthorizationCode,
 )
 
 
@@ -43,7 +40,7 @@ class TestServerConfigs:
             assert config.server_scopes == ""
             assert config.server_base_url == ""
             assert config.mcp_request_timeout == 30
-            assert config.server_access_token is None
+            assert config.server_auth_mode == "none"
 
     def test_effective_server_url_default(self):
         """Test effective server URL with default values."""
@@ -77,37 +74,55 @@ class TestServerConfigs:
             assert config.server_base_url == "https://example.com/fhir"
             assert config.mcp_request_timeout == 120
 
-    def test_callback_url_basic(self):
-        """Test callback URL generation."""
+    def test_default_authorization_settings(self):
+        """MCP authorization defaults to resource-server mode with per-tool scopes."""
         with patch.dict(os.environ, {}, clear=True):
             config = ServerConfigs(_env_file=None)
-            callback_url = config.callback_url("https://example.com:8000")
-            assert str(callback_url) == "https://example.com:8000/oauth/callback"
+            assert config.mcp_auth_mode == "resource_server"
+            assert (config.mcp_read_scope, config.mcp_write_scope, config.mcp_delete_scope) == (
+                "fhir-read", "fhir-write", "fhir-delete"
+            )
 
-    def test_callback_url_custom_suffix(self):
-        """Test callback URL generation with custom suffix."""
+    def test_effective_resource_url_defaults_to_mcp_endpoint(self):
         with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(mcp_server_url="https://mcp.example.com/", _env_file=None)
+            assert config.effective_resource_url == "https://mcp.example.com/mcp"
+
+    def test_effective_resource_url_explicit(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(mcp_resource_url="https://mcp.example.com/fhir/mcp/", _env_file=None)
+            assert config.effective_resource_url == "https://mcp.example.com/fhir/mcp"
+
+    def test_server_auth_mode_defaults_to_none(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert ServerConfigs(_env_file=None).effective_server_auth_mode == "none"
+
+    def test_local_mode_without_any_sign_in_passes(self):
+        with patch.dict(os.environ, {}, clear=True):
+            ServerConfigs(mcp_auth_mode="disabled", server_auth_mode="none", _env_file=None).validate_for_startup()
+
+    def test_allowed_hosts_and_origins_split(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(
+                mcp_allowed_hosts="mcp.example.com, mcp.example.com:443",
+                mcp_allowed_origins="https://app.example.com",
+                _env_file=None,
+            )
+            assert config.allowed_hosts == ["mcp.example.com", "mcp.example.com:443"]
+            assert config.allowed_origins == ["https://app.example.com"]
+
+    def test_startup_rejects_removed_disable_authorization(self):
+        with patch.dict(os.environ, {"FHIR_SERVER_DISABLE_AUTHORIZATION": "True"}, clear=True):
             config = ServerConfigs(_env_file=None)
-            callback_url = config.callback_url("https://example.com:8000", "/custom/fhir")
-            assert str(callback_url) == "https://example.com:8000/custom/fhir"
+            with pytest.raises(ConfigurationError, match="FHIR_MCP_AUTH_MODE=disabled"):
+                config.validate_for_startup()
 
-    def test_discovery_url_property(self):
-        """Test discovery URL property."""
+    def test_startup_requires_issuer_in_resource_server_mode(self):
         with patch.dict(os.environ, {}, clear=True):
-            config = ServerConfigs(server_base_url="https://custom.fhir.org/R4", _env_file=None)
-            assert (
-                config.discovery_url
-                == "https://custom.fhir.org/R4/.well-known/smart-configuration"
-            )
-
-    def test_discovery_url_with_trailing_slash(self):
-        """Test discovery URL property with trailing slash."""
-        with patch.dict(os.environ, {}, clear=True):
-            config = ServerConfigs(server_base_url="https://custom.fhir.org/R4/", _env_file=None)
-            assert (
-                config.discovery_url
-                == "https://custom.fhir.org/R4/.well-known/smart-configuration"
-            )
+            with pytest.raises(ConfigurationError, match="FHIR_MCP_IDP_ISSUER"):
+                ServerConfigs(_env_file=None).validate_for_startup()
+            ServerConfigs(mcp_auth_mode="disabled", _env_file=None).validate_for_startup()
+            ServerConfigs(mcp_idp_issuer="https://idp.example.com", _env_file=None).validate_for_startup()
 
     def test_metadata_url_property(self):
         """Test metadata URL property."""
@@ -140,124 +155,42 @@ class TestServerConfigs:
             assert config.scopes == ["read", "write", "admin"]
 
 
-class TestOAuthMetadata:
-    """Test the OAuthMetadata class."""
+class TestTokenExchangeConfiguration:
+    """FHIR_SERVER_AUTH_MODE=token_exchange: exchanges Token A for a FHIR-audienced token."""
 
-    def test_basic_metadata(self):
-        """Test basic OAuth metadata."""
-        metadata = OAuthMetadata(
-            issuer=AnyHttpUrl("https://example.com"),
-            authorization_endpoint=AnyHttpUrl("https://example.com/auth"),
-            token_endpoint=AnyHttpUrl("https://example.com/token"),
-            response_types_supported=["code"],
+    def _check(self, **values) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            ServerConfigs(
+                mcp_idp_issuer="https://idp.example.com",
+                server_auth_mode="token_exchange",
+                _env_file=None,
+                **values,
+            ).validate_for_startup()
+
+    def test_requires_resource_server_mode(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(
+                mcp_auth_mode="disabled",
+                server_auth_mode="token_exchange",
+                server_client_id="a",
+                server_client_secret="b",
+                server_token_resource="https://fhir.example.com",
+                _env_file=None,
+            )
+            with pytest.raises(ConfigurationError, match="FHIR_MCP_AUTH_MODE=resource_server"):
+                config.validate_for_startup()
+
+    def test_requires_token_resource(self):
+        with pytest.raises(ConfigurationError, match="FHIR_SERVER_TOKEN_RESOURCE"):
+            self._check(server_client_id="a", server_client_secret="b")
+
+    def test_requires_client_id_and_secret(self):
+        with pytest.raises(ConfigurationError, match="FHIR_SERVER_CLIENT_ID"):
+            self._check(server_token_resource="https://fhir.example.com")
+        with pytest.raises(ConfigurationError, match="FHIR_SERVER_CLIENT_SECRET"):
+            self._check(server_client_id="a", server_token_resource="https://fhir.example.com")
+
+    def test_complete_configuration_passes(self):
+        self._check(
+            server_client_id="a", server_client_secret="b", server_token_resource="https://fhir.example.com"
         )
-        # URLs get normalized by pydantic - trailing slash may be added
-        assert str(metadata.issuer).rstrip("/") == "https://example.com"
-        assert str(metadata.authorization_endpoint) == "https://example.com/auth"
-        assert str(metadata.token_endpoint) == "https://example.com/token"
-        assert metadata.response_types_supported == ["code"]
-
-    def test_metadata_with_optional_fields(self):
-        """Test OAuth metadata with optional fields."""
-        metadata = OAuthMetadata(
-            issuer=AnyHttpUrl("https://example.com"),
-            authorization_endpoint=AnyHttpUrl("https://example.com/auth"),
-            token_endpoint=AnyHttpUrl("https://example.com/token"),
-            response_types_supported=["code"],
-            scopes_supported=["read", "write"],
-            grant_types_supported=["authorization_code"],
-            code_challenge_methods_supported=["S256"],
-        )
-        assert metadata.scopes_supported == ["read", "write"]
-        assert metadata.grant_types_supported == ["authorization_code"]
-        assert metadata.code_challenge_methods_supported == ["S256"]
-
-    def test_metadata_validation_error(self):
-        """Test OAuth metadata validation error."""
-        with pytest.raises(ValidationError):
-            OAuthMetadata(
-                # Missing required fields
-                issuer="https://example.com"
-            ) # type: ignore
-
-
-class TestOAuthToken:
-    """Test the OAuthToken class."""
-
-    def test_basic_token(self):
-        """Test basic OAuth token."""
-        token = OAuthToken(access_token="test_access_token", token_type="Bearer")
-        assert token.access_token == "test_access_token"
-        assert token.token_type == "Bearer"
-        assert token.expires_in is None
-        assert token.scope is None
-        assert token.refresh_token is None
-
-    def test_token_with_all_fields(self):
-        """Test OAuth token with all fields."""
-        token = OAuthToken(
-            access_token="test_access_token",
-            token_type="Bearer",
-            expires_in=3600,
-            scope="read write",
-            refresh_token="test_refresh_token",
-            expires_at=1234567890.0,
-        )
-        assert token.access_token == "test_access_token"
-        assert token.token_type == "Bearer"
-        assert token.expires_in == 3600
-        assert token.scope == "read write"
-        assert token.refresh_token == "test_refresh_token"
-        assert token.expires_at == 1234567890.0
-
-    def test_scopes_property_with_scope(self):
-        """Test scopes property with scope string."""
-        token = OAuthToken(
-            access_token="test_token", token_type="Bearer", scope="read write admin"
-        )
-        assert token.scopes == ["read", "write", "admin"]
-
-    def test_scopes_property_no_scope(self):
-        """Test scopes property without scope."""
-        token = OAuthToken(access_token="test_token", token_type="Bearer")
-        assert token.scopes == []
-
-    def test_scopes_property_empty_scope(self):
-        """Test scopes property with empty scope."""
-        token = OAuthToken(access_token="test_token", token_type="Bearer", scope="")
-        # Empty scope results in empty list, not list with empty string
-        assert token.scopes == []
-
-
-class TestAuthorizationCode:
-    """Test the AuthorizationCode class."""
-
-    def test_basic_authorization_code(self):
-        """Test basic authorization code."""
-        auth_code = AuthorizationCode(
-            code="test_code",
-            scopes=["read", "write"],
-            expires_at=1234567890.0,
-            client_id="test_client",
-            code_verifier="test_verifier",
-            code_challenge="test_challenge",
-            redirect_uri=AnyHttpUrl("https://example.com/callback"),
-            redirect_uri_provided_explicitly=True,
-        )
-
-        assert auth_code.code == "test_code"
-        assert auth_code.scopes == ["read", "write"]
-        assert auth_code.expires_at == 1234567890.0
-        assert auth_code.client_id == "test_client"
-        assert auth_code.code_verifier == "test_verifier"
-        assert auth_code.code_challenge == "test_challenge"
-        assert str(auth_code.redirect_uri) == "https://example.com/callback"
-        assert auth_code.redirect_uri_provided_explicitly is True
-
-    def test_authorization_code_validation_error(self):
-        """Test authorization code validation error."""
-        with pytest.raises(ValidationError):
-            AuthorizationCode(
-                # Missing required fields
-                code="test_code"
-            ) # type: ignore

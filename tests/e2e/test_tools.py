@@ -23,8 +23,7 @@ import uuid
 
 from typing import Dict
 import mcp.types as types
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+from mcp import Client
 from contextlib import asynccontextmanager
 
 logging.basicConfig(
@@ -37,10 +36,9 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def create_mcp_session():
-    async with streamable_http_client("http://localhost:8001/mcp/") as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield session
+    # "auto" negotiates 2026-07-28 with this server; the safety-net tests cover legacy clients.
+    async with Client("http://localhost:8001/mcp/", mode="auto") as client:
+        yield client
 
 
 @pytest.mark.asyncio
@@ -248,7 +246,7 @@ async def test_tool_delete(mcp_server, patient_id):
 async def extract_resource(tool_result: types.CallToolResult) -> Dict:
     logger.debug(f"[TOOL RESULT] : {tool_result!r}")
     assert tool_result is not None
-    assert not tool_result.isError
+    assert not tool_result.is_error
     assert tool_result.content, "No content in the tool result"
 
     text: str | None = None
