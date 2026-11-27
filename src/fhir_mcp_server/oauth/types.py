@@ -1,6 +1,6 @@
-# Copyright (c) 2025-2026, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
+# Copyright (c) 2025-2026, Choreo Labs LLC. (https://choreolabs.com)
 
-# WSO2 LLC. licenses this file to you under the Apache License,
+# Choreo Labs licenses this file to you under the Apache License,
 # Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.
 # You may obtain a copy of the License at
@@ -21,6 +21,9 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+# Hosts that mean "listen on every interface"; never an address a browser can open.
+WILDCARD_HOSTS = ("0.0.0.0", "::", "[::]")
 
 
 class ConfigurationError(ValueError):
@@ -123,6 +126,14 @@ class ServerConfigs(BaseSettings):
             if "openid" not in self.scopes:
                 raise ConfigurationError(
                     "FHIR_SERVER_SCOPES needs `openid fhirUser`, so the FHIR server says who signed in."
+                )
+            if not self.mcp_server_url and self.mcp_host in WILDCARD_HOSTS:
+                # Listening on every interface (as in a container), the server cannot tell the
+                # URL browsers use to reach it, which the consent link and FHIR redirect need.
+                raise ConfigurationError(
+                    f"Set FHIR_MCP_SERVER_URL to the URL browsers use to reach this server, for example "
+                    f"http://localhost:{self.mcp_port}, when FHIR_MCP_HOST is {self.mcp_host}: consent links "
+                    "and the FHIR server's sign-in redirect (<that URL>/connect/fhir/callback) use it."
                 )
 
 

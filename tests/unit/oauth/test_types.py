@@ -1,6 +1,6 @@
-# Copyright (c) 2025-2026, WSO2 LLC. (https://www.wso2.com/) All Rights Reserved.
+# Copyright (c) 2025-2026, Choreo Labs LLC. (https://choreolabs.com)
 
-# WSO2 LLC. licenses this file to you under the Apache License,
+# Choreo Labs licenses this file to you under the Apache License,
 # Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.
 # You may obtain a copy of the License at
@@ -176,3 +176,16 @@ class TestAgentSignInConfiguration:
                 mcp_idp_issuer="https://idp.example.com", server_client_id="a", server_scopes="openid fhirUser",
                 _env_file=None,
             ).validate_for_startup()
+
+    def test_listening_on_every_interface_needs_the_public_url(self):
+        """In a container (FHIR_MCP_HOST=0.0.0.0), consent links would point at http://0.0.0.0."""
+        base = {
+            "mcp_idp_issuer": "https://idp.example.com", "server_client_id": "a",
+            "server_scopes": "openid fhirUser", "mcp_host": "0.0.0.0", "_env_file": None,
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(ConfigurationError, match="FHIR_MCP_SERVER_URL"):
+                ServerConfigs(**base).validate_for_startup()
+            ServerConfigs(**base, mcp_server_url="http://localhost:8000").validate_for_startup()
+            # Without FHIR sign-in there are no links, so the wildcard host is fine.
+            ServerConfigs(**{**base, "server_client_id": ""}).validate_for_startup()

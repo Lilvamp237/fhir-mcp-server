@@ -245,6 +245,17 @@ To use a different FHIR server, run the FHIR MCP server container with `FHIR_SER
 For any other FHIR server, set `FHIR_SERVER_BASE_URL` to its base URL. If the FHIR server runs on your host rather than in Docker, use `http://host.docker.internal:<port>/...` instead of `localhost`. 
 On Linux, also add `--add-host=host.docker.internal:host-gateway` to the `docker run` command, and make sure the FHIR server listens on an address reachable from containers (for example `0.0.0.0`, not only `127.0.0.1`).
 
+#### Linking agents in Docker
+
+With `FHIR_SERVER_CLIENT_ID` set (see [Linking agents](#linking-agents)), the container also needs:
+
+- **`FHIR_MCP_SERVER_URL`**: the URL browsers use to reach the server, for example `http://localhost:8000`. The consent link and the FHIR server's sign-in redirect use it, so register `<FHIR_MCP_SERVER_URL>/connect/fhir/callback` as the FHIR app's redirect URI. The server refuses to start without it while it listens on `0.0.0.0`.
+- **An identity provider the container can reach**, with the same issuer its tokens carry (`FHIR_MCP_IDP_ISSUER`). Inside the container, `localhost` is the container itself. For an identity provider on your machine, run the container with `--network host` (Linux), or give the identity provider a hostname that both your machine and the container resolve.
+
+```bash
+docker run --env-file .env -e FHIR_MCP_SERVER_URL=http://localhost:8000 -p 8000:8000 fhir-mcp-server
+```
+
 ## Integration with MCP Clients
 
 The FHIR MCP Server is designed for seamless integration with various MCP clients.
