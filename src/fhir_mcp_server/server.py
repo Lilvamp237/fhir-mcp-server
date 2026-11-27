@@ -33,7 +33,7 @@ from fhir_mcp_server.utils import (
     validate_inputs,
 )
 from fhir_mcp_server.auth import ScopeChallengeMiddleware, ToolScopeMiddleware, create_token_verifier, tool_scopes
-from fhir_mcp_server.backend_auth import BackendAuthError, TokenExchangeProvider
+from fhir_mcp_server.backend_auth import BackendAuthError
 from fhir_mcp_server.fhir_connect import FhirConnect
 from fhir_mcp_server.oauth import IDToken, ServerConfigs
 from fhir_mcp_server.oauth.types import ConfigurationError
@@ -69,57 +69,58 @@ except PackageNotFoundError:
 
 configs: ServerConfigs = ServerConfigs()
 
-token_exchange_provider: TokenExchangeProvider = TokenExchangeProvider(configs)
-
-# Per-user FHIR sign-ins (FHIR_SERVER_AUTH_MODE=user_smart_login); replaced by configure_mcp_server().
+# Agent sessions and the browser linking flow (when FHIR_SERVER_CLIENT_ID is set);
+# replaced by configure_mcp_server().
 fhir_connect: FhirConnect = FhirConnect(configs)
 
 FHIR_CONNECT_MESSAGE = (
-    "Connect your FHIR server account to continue. Sign in with the link, then retry the request."
+    "Link this agent to your FHIR server account to continue: open the link, choose the tools "
+    "the agent may use, and sign in. Then retry the request."
+)
+FHIR_TOOL_NOT_ALLOWED_MESSAGE = (
+    "You have not allowed this agent to use '{tool}'. To allow it, open the link, add the tool, "
+    "and sign in with the same account. Then retry the request."
 )
 FHIR_CONNECT_DECLINED_MESSAGE = (
-    "The user declined to connect their FHIR server account, so this request was not run. "
+    "The user declined to link this agent or allow the tool, so this request was not run. "
     "Tell the user they declined and that they can ask to try again. "
     "Do not call FHIR tools again unless the user asks to."
 )
 FHIR_CONNECT_INPUT = "fhir-connect"  # key of the connect link in InputRequiredResult.inputRequests
 
 
+def _agent() -> tuple[str, str] | None:
+    """The calling agent's (sub, client_id), from its validated MCP access token."""
+    access_token: AccessToken | None = get_access_token()
+    if access_token is None or not access_token.subject:
+        return None
+    return access_token.subject, access_token.client_id
+
+
 async def get_backend_access_token() -> str | None:
     """
-    The credential sent to the FHIR server, chosen by FHIR_SERVER_AUTH_MODE.
+    The credential sent to the FHIR server: with FHIR_SERVER_CLIENT_ID set, the FHIR token
+    of the user the calling agent acts for; otherwise none (an open FHIR server).
     The MCP access token is never forwarded to the FHIR server.
     """
-    mode: str = configs.effective_server_auth_mode
-    if mode in ("token_exchange", "token_vault"):
-        access_token: AccessToken | None = get_access_token()
-        if access_token is None:
-            raise BackendAuthError(f"{mode} requires a validated MCP access token.")
-        return await token_exchange_provider.exchange(access_token.token, access_token.subject)
-    if mode == "user_smart_login":
-        access_token: AccessToken | None = get_access_token()
-        token = (
-            await fhir_connect.user_token(access_token.subject, access_token.client_id)
-            if access_token and access_token.subject
-            else None
-        )
-        if token is None:
-            raise BackendAuthError("The user has not connected their FHIR server account.")
-        return token
-    return None
+    if not configs.fhir_sign_in:
+        return None
+    agent = _agent()
+    token = await fhir_connect.user_token(*agent) if agent else None
+    if token is None:
+        raise BackendAuthError("No user has linked this agent to their FHIR server account.")
+    return token
 
 
 async def get_metadata_access_token() -> str | None:
     """
-    The credential for the metadata endpoint. A per-user server's metadata is public
-    (SMART), so a user who has not connected yet reads it without a token.
+    The credential for the metadata endpoint. A FHIR server's metadata is public
+    (SMART), so an agent that is not linked yet reads it without a token.
     """
-    if configs.effective_server_auth_mode == "user_smart_login":
-        try:
-            return await get_backend_access_token()
-        except BackendAuthError:
-            return None
-    return await get_backend_access_token()
+    try:
+        return await get_backend_access_token()
+    except BackendAuthError:
+        return None
 
 
 async def get_async_fhir_client() -> AsyncFHIRClient:
@@ -150,34 +151,32 @@ FHIR_FORBIDDEN_MESSAGE = (
 
 
 async def forget_backend_token() -> bool:
-    """Drop the user's cached FHIR token in the modes that cache one. True if dropped."""
-    if configs.effective_server_auth_mode not in ("token_exchange", "token_vault"):
+    """Stop using the agent's FHIR access token after the FHIR server rejected it.
+    True if there was one to replace."""
+    if not configs.fhir_sign_in:
         return False
-    access_token: AccessToken | None = get_access_token()
-    if access_token is None or not access_token.subject:
-        return False
-    await token_exchange_provider.forget(access_token.subject)
-    return True
+    agent = _agent()
+    return bool(agent) and await fhir_connect.expire_token(*agent)
 
 
 async def call_fhir(operation: Callable[[AsyncFHIRClient], Awaitable[T]]) -> T:
     """Run a FHIR request with the backend credential.
 
-    If the FHIR server rejects a cached token (401), for example because the upstream revoked
-    it when the user signed in again, the token is dropped and the request retried once with a
-    fresh one. A refused request (401 or 403) becomes an OperationOutcome that says so.
+    If the FHIR server rejects the token (401), for example because it revoked it when the
+    user signed in again, the token is refreshed and the request retried once. A refused
+    request (401 or 403) becomes an OperationOutcome that says so.
     """
     try:
         return await operation(await get_async_fhir_client())
     except AuthorizationError:
         if not await forget_backend_token():
             raise OperationOutcome(FHIR_UNAUTHORIZED_MESSAGE, code="login") from None
-        logger.info("The FHIR server rejected the cached token; retrying once with a fresh one.")
+        logger.info("The FHIR server rejected the agent's token; retrying once with a fresh one.")
     except ForbiddenError:
         raise OperationOutcome(FHIR_FORBIDDEN_MESSAGE, code="forbidden") from None
     try:
         return await operation(await get_async_fhir_client())
-    except AuthorizationError:
+    except (AuthorizationError, BackendAuthError):
         raise OperationOutcome(FHIR_UNAUTHORIZED_MESSAGE, code="login") from None
     except ForbiddenError:
         raise OperationOutcome(FHIR_FORBIDDEN_MESSAGE, code="forbidden") from None
@@ -203,50 +202,54 @@ async def check_tool_scope(tool: str) -> Dict[str, Any] | None:
 
 async def check_tool_access(tool: str, ctx: Context) -> Dict[str, Any] | InputRequiredResult | None:
     """
-    The tool's scope check, then, with FHIR_SERVER_AUTH_MODE=user_smart_login, whether
-    the user has connected their FHIR server account on this MCP client. If not, the
-    client is asked to open a sign-in link (URL-mode elicitation): an
-    `InputRequiredResult` on 2026-07-28, a URL elicitation error on earlier protocol
-    versions, and the link as text to clients that have not declared URL elicitation.
+    The tool's scope check, then, with FHIR_SERVER_CLIENT_ID set, whether a user has
+    linked the calling agent and allowed it this tool. If not, the client is asked to
+    open the consent link (URL-mode elicitation): an `InputRequiredResult` on
+    2026-07-28, a URL elicitation error on earlier protocol versions, and the link as
+    text to clients that have not declared URL elicitation.
     Returns None when the tool may run.
     """
     if outcome := await check_tool_scope(tool):
         return outcome
-    if configs.effective_server_auth_mode != "user_smart_login":
+    if not configs.fhir_sign_in:
         return None
     access_token: AccessToken | None = get_access_token()
     if access_token is None or not access_token.subject:
         return None
     sub, client_id = access_token.subject, access_token.client_id
-    if await fhir_connect.user_token(sub, client_id):
+    linked = await fhir_connect.user_token(sub, client_id) is not None
+    if linked and await fhir_connect.allows(sub, client_id, tool):
         return None
+    message = FHIR_TOOL_NOT_ALLOWED_MESSAGE.format(tool=tool) if linked else FHIR_CONNECT_MESSAGE
 
     answer = (ctx.input_responses or {}).get(FHIR_CONNECT_INPUT)
     action = answer.action if isinstance(answer, ElicitResult) else (answer or {}).get("action") if isinstance(answer, dict) else None
     if action in ("decline", "cancel"):
         # The user turned the link down: stop asking on this request and withdraw the link.
         await fhir_connect.cancel_link(sub, client_id)
-        logger.info("A user %s the FHIR sign-in link.", "declined" if action == "decline" else "cancelled")
+        logger.info("A user %s the agent link.", "declined" if action == "decline" else "cancelled")
         return await get_operation_outcome(code="login", diagnostics=FHIR_CONNECT_DECLINED_MESSAGE)
 
-    link: str = await fhir_connect.connect_link(sub, client_id, (access_token.claims or {}).get("fhirUser"))
+    link: str = await fhir_connect.connect_link(
+        sub, client_id, (access_token.claims or {}).get("fhirUser"), access_token.scopes, tool
+    )
     capabilities = ctx.client_capabilities
     supports_url = bool(capabilities and capabilities.elicitation and capabilities.elicitation.url)
     if not supports_url:
         # No declared URL elicitation support (including earlier-protocol requests to this
         # stateless endpoint, which carry no capabilities): never send an elicitation
         # mode the client has not declared, so give the link as text instead.
-        return await get_operation_outcome(code="login", diagnostics=f"{FHIR_CONNECT_MESSAGE} {link}")
+        return await get_operation_outcome(code="login", diagnostics=f"{message} {link}")
     if is_version_at_least(ctx.protocol_version or "", "2026-07-28"):
         return InputRequiredResult(
             input_requests={
-                FHIR_CONNECT_INPUT: ElicitRequest(params=ElicitRequestURLParams(message=FHIR_CONNECT_MESSAGE, url=link))
+                FHIR_CONNECT_INPUT: ElicitRequest(params=ElicitRequestURLParams(message=message, url=link))
             }
         )
     # An earlier-protocol client that declared URL elicitation: the URL elicitation error (-32042).
     raise UrlElicitationRequiredError(
-        [ElicitRequestURLParams(message=FHIR_CONNECT_MESSAGE, url=link, elicitation_id=secrets.token_urlsafe(16))],
-        message=f"{FHIR_CONNECT_MESSAGE} {link}",
+        [ElicitRequestURLParams(message=message, url=link, elicitation_id=secrets.token_urlsafe(16))],
+        message=f"{message} {link}",
     )
 
 
@@ -278,10 +281,10 @@ def configure_mcp_server() -> MCPServer:
         mcp_kwargs["token_verifier"] = create_token_verifier(configs)
     else:
         logger.warning("MCP authorization is disabled.")
-    if configs.effective_server_auth_mode == "none":
-        logger.warning("Requests to the FHIR server carry no credential (FHIR_SERVER_AUTH_MODE=none).")
+    if not configs.fhir_sign_in:
+        logger.warning("Requests to the FHIR server carry no credential (FHIR_SERVER_CLIENT_ID is not set).")
     mcp: MCPServer = MCPServer(**mcp_kwargs)
-    if configs.effective_server_auth_mode == "user_smart_login":
+    if configs.fhir_sign_in:
         global fhir_connect
         fhir_connect = FhirConnect(configs)
         fhir_connect.register_routes(mcp)
@@ -968,17 +971,14 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 logger.debug("Unauthorized access attempt to get_user.")
                 return {}
 
-            # With user_smart_login, the patient the user's own FHIR sign-in returned comes
-            # first, so an IdP account needs no fhirUser claim (for example a self-registered one).
-            fhir_patient: str | None = None
-            if configs.effective_server_auth_mode == "user_smart_login" and access_token.subject:
-                fhir_patient = await fhir_connect.user_patient(access_token.subject, access_token.client_id)
-            if fhir_patient:
-                resource_type, resource_id = "Patient", fhir_patient
-            else:
-                fhir_user = IDToken(fhirUser=(access_token.claims or {}).get("fhirUser"))
-                resource_id = fhir_user.resource_id
-                resource_type = fhir_user.resource_type
+            # The user the agent acts for, as their own FHIR sign-in named them, comes first:
+            # an agent's token has no fhirUser claim.
+            fhir_identity: str | None = None
+            if configs.fhir_sign_in and access_token.subject:
+                fhir_identity = await fhir_connect.user_identity(access_token.subject, access_token.client_id)
+            fhir_user = IDToken(fhirUser=fhir_identity or (access_token.claims or {}).get("fhirUser"))
+            resource_id = fhir_user.resource_id
+            resource_type = fhir_user.resource_type
 
             if not resource_id or not resource_type:
                 logger.debug("Neither the FHIR sign-in nor the access token names the user's FHIR record.")

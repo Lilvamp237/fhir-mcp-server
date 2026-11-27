@@ -1,0 +1,9 @@
+{
+  "client_id": "<the agent's client ID at your IdP>",
+  "client_secret": "<the agent's client secret>",
+  "issuer": "https://localhost:8090",
+  "token_endpoint": "https://localhost:8090/oauth2/token",
+  "resource": "http://localhost:8000/mcp",
+  "scope": "fhir_read fhir_write",
+  "ca_cert": "<path to the IdP's CA certificate, only for a self-signed one; otherwise remove this line>"
+}

@@ -112,8 +112,7 @@ async def run_mcp_server(fhir_base_url: str) -> AsyncGenerator[bool, Any]:
     env["FHIR_MCP_HOST"] = "localhost"
     env["FHIR_MCP_PORT"] = "8001"
     env["FHIR_MCP_AUTH_MODE"] = "disabled"
-    env["FHIR_SERVER_AUTH_MODE"] = "none"
-    env.pop("FHIR_SERVER_DISABLE_AUTHORIZATION", None)
+    env["FHIR_SERVER_CLIENT_ID"] = ""  # the live FHIR server needs no credential
 
     logger.info("Starting MCP server with: uv run fhir-mcp-server")
     process = subprocess.Popen(

@@ -40,7 +40,7 @@ class TestServerConfigs:
             assert config.server_scopes == ""
             assert config.server_base_url == ""
             assert config.mcp_request_timeout == 30
-            assert config.server_auth_mode == "none"
+            assert config.fhir_sign_in is False
 
     def test_effective_server_url_default(self):
         """Test effective server URL with default values."""
@@ -93,13 +93,14 @@ class TestServerConfigs:
             config = ServerConfigs(mcp_resource_url="https://mcp.example.com/fhir/mcp/", _env_file=None)
             assert config.effective_resource_url == "https://mcp.example.com/fhir/mcp"
 
-    def test_server_auth_mode_defaults_to_none(self):
+    def test_fhir_sign_in_follows_the_client_id(self):
         with patch.dict(os.environ, {}, clear=True):
-            assert ServerConfigs(_env_file=None).effective_server_auth_mode == "none"
+            assert ServerConfigs(_env_file=None).fhir_sign_in is False
+            assert ServerConfigs(server_client_id="app", _env_file=None).fhir_sign_in is True
 
     def test_local_mode_without_any_sign_in_passes(self):
         with patch.dict(os.environ, {}, clear=True):
-            ServerConfigs(mcp_auth_mode="disabled", server_auth_mode="none", _env_file=None).validate_for_startup()
+            ServerConfigs(mcp_auth_mode="disabled", _env_file=None).validate_for_startup()
 
     def test_allowed_hosts_and_origins_split(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -110,12 +111,6 @@ class TestServerConfigs:
             )
             assert config.allowed_hosts == ["mcp.example.com", "mcp.example.com:443"]
             assert config.allowed_origins == ["https://app.example.com"]
-
-    def test_startup_rejects_removed_disable_authorization(self):
-        with patch.dict(os.environ, {"FHIR_SERVER_DISABLE_AUTHORIZATION": "True"}, clear=True):
-            config = ServerConfigs(_env_file=None)
-            with pytest.raises(ConfigurationError, match="FHIR_MCP_AUTH_MODE=disabled"):
-                config.validate_for_startup()
 
     def test_startup_requires_issuer_in_resource_server_mode(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -155,42 +150,29 @@ class TestServerConfigs:
             assert config.scopes == ["read", "write", "admin"]
 
 
-class TestTokenExchangeConfiguration:
-    """FHIR_SERVER_AUTH_MODE=token_exchange: exchanges Token A for a FHIR-audienced token."""
-
-    def _check(self, **values) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            ServerConfigs(
-                mcp_idp_issuer="https://idp.example.com",
-                server_auth_mode="token_exchange",
-                _env_file=None,
-                **values,
-            ).validate_for_startup()
+class TestAgentSignInConfiguration:
+    """FHIR_SERVER_CLIENT_ID set: users sign in at the FHIR server for the agents they link."""
 
     def test_requires_resource_server_mode(self):
         with patch.dict(os.environ, {}, clear=True):
             config = ServerConfigs(
-                mcp_auth_mode="disabled",
-                server_auth_mode="token_exchange",
-                server_client_id="a",
-                server_client_secret="b",
-                server_token_resource="https://fhir.example.com",
-                _env_file=None,
+                mcp_auth_mode="disabled", server_client_id="a", server_scopes="openid fhirUser", _env_file=None
             )
             with pytest.raises(ConfigurationError, match="FHIR_MCP_AUTH_MODE=resource_server"):
                 config.validate_for_startup()
 
-    def test_requires_token_resource(self):
-        with pytest.raises(ConfigurationError, match="FHIR_SERVER_TOKEN_RESOURCE"):
-            self._check(server_client_id="a", server_client_secret="b")
-
-    def test_requires_client_id_and_secret(self):
-        with pytest.raises(ConfigurationError, match="FHIR_SERVER_CLIENT_ID"):
-            self._check(server_token_resource="https://fhir.example.com")
-        with pytest.raises(ConfigurationError, match="FHIR_SERVER_CLIENT_SECRET"):
-            self._check(server_client_id="a", server_token_resource="https://fhir.example.com")
+    def test_requires_openid_scope(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ServerConfigs(
+                mcp_idp_issuer="https://idp.example.com", server_client_id="a", server_scopes="patient/*.read",
+                _env_file=None,
+            )
+            with pytest.raises(ConfigurationError, match="openid"):
+                config.validate_for_startup()
 
     def test_complete_configuration_passes(self):
-        self._check(
-            server_client_id="a", server_client_secret="b", server_token_resource="https://fhir.example.com"
-        )
+        with patch.dict(os.environ, {}, clear=True):
+            ServerConfigs(
+                mcp_idp_issuer="https://idp.example.com", server_client_id="a", server_scopes="openid fhirUser",
+                _env_file=None,
+            ).validate_for_startup()

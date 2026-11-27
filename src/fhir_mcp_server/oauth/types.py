@@ -61,29 +61,18 @@ class ServerConfigs(BaseSettings):
     mcp_read_scope: str = "fhir-read"
     mcp_write_scope: str = "fhir-write"
     mcp_delete_scope: str = "fhir-delete"
-    # Where per-user FHIR tokens and pending sign-ins are kept: "memory" (default, lost on
-    # restart) or "module:function" returning a custom store (see fhir_mcp_server.token_store).
-    mcp_token_store: str = "memory"
 
     # FHIR settings
     server_base_url: str = ""
-    # none: no credential (open or local FHIR server)
-    # token_exchange: exchange the caller's MCP token at the same IdP (RFC 8693)
-    # user_smart_login: each user signs in at the FHIR server (SMART App Launch); the IdP
-    #   federates to the FHIR server, and the FHIR sign-in must match the MCP token's fhirUser
-    # token_vault: the IdP keeps the user's FHIR token (e.g. from a federated sign-in) and
-    #   releases it to the MCP server for the caller's MCP token
-    server_auth_mode: Literal["none", "token_exchange", "user_smart_login", "token_vault"] = "none"
-    server_authorize_url: str | None = None  # user_smart_login; defaults to the FHIR server's SMART configuration
-    server_token_url: str | None = None
-    server_token_resource: str | None = None  # token_exchange: the FHIR API's audience; token_vault: its resource
-    server_vault_grant_type: str = "urn:thunderid:params:oauth:grant-type:upstream-token"
+    # The FHIR server's app (for example an Epic app) that each user signs in with, on behalf
+    # of the agent they link. Without it, requests to the FHIR server carry no credential
+    # (an open or local FHIR server).
     server_client_id: str = ""
-    server_client_secret: str = ""
+    server_client_secret: str = ""  # empty: a public client (PKCE only)
     server_scopes: str = ""
+    server_authorize_url: str | None = None  # defaults to the FHIR server's SMART configuration
+    server_token_url: str | None = None
     server_ca_cert: str | None = None
-
-    server_disable_authorization: str | None = None
 
     @property
     def metadata_url(self) -> str:
@@ -103,8 +92,10 @@ class ServerConfigs(BaseSettings):
         return (self.mcp_resource_url or f"{self.effective_server_url.rstrip('/')}/mcp").rstrip("/")
 
     @property
-    def effective_server_auth_mode(self) -> str:
-        return self.server_auth_mode
+    def fhir_sign_in(self) -> bool:
+        """Whether users sign in at the FHIR server for the agents they link
+        (FHIR_SERVER_CLIENT_ID is set). Otherwise the FHIR server gets no credential."""
+        return bool(self.server_client_id)
 
     @property
     def allowed_hosts(self) -> list[str]:
@@ -115,17 +106,7 @@ class ServerConfigs(BaseSettings):
         return _split(self.mcp_allowed_origins)
 
     def validate_for_startup(self) -> None:
-        """Reject removed settings and incomplete configurations with a clear message."""
-        if self.mcp_token_store.strip() != "memory":
-            from fhir_mcp_server.token_store import store_factory  # avoids a circular import
-
-            store_factory(self.mcp_token_store.strip())  # raises ConfigurationError if it cannot load
-        if self.server_disable_authorization is not None:
-            raise ConfigurationError(
-                "FHIR_SERVER_DISABLE_AUTHORIZATION is no longer supported. Use "
-                "FHIR_MCP_AUTH_MODE=disabled (MCP login) and FHIR_SERVER_AUTH_MODE "
-                "(how the server calls the FHIR server) instead."
-            )
+        """Reject incomplete configurations with a clear message."""
         if self.mcp_auth_mode == "resource_server":
             if not self.mcp_idp_issuer:
                 raise ConfigurationError(
@@ -133,37 +114,16 @@ class ServerConfigs(BaseSettings):
                     "Set it to your identity provider's issuer URL, or set FHIR_MCP_AUTH_MODE=disabled "
                     "for local development."
                 )
-        mode = self.effective_server_auth_mode
-        if mode == "user_smart_login":
+        if self.fhir_sign_in:
             if self.mcp_auth_mode != "resource_server":
                 raise ConfigurationError(
-                    "FHIR_SERVER_AUTH_MODE=user_smart_login needs FHIR_MCP_AUTH_MODE=resource_server, "
-                    "because each user's FHIR sign-in is tied to their MCP login."
+                    "FHIR_SERVER_CLIENT_ID needs FHIR_MCP_AUTH_MODE=resource_server: each user's FHIR "
+                    "sign-in is tied to the agent named by its MCP access token."
                 )
             if "openid" not in self.scopes:
                 raise ConfigurationError(
-                    "FHIR_SERVER_AUTH_MODE=user_smart_login needs `openid fhirUser` in FHIR_SERVER_SCOPES, "
-                    "so the FHIR server says who signed in."
+                    "FHIR_SERVER_SCOPES needs `openid fhirUser`, so the FHIR server says who signed in."
                 )
-        if mode in ("token_exchange", "token_vault"):
-            if self.mcp_auth_mode != "resource_server":
-                raise ConfigurationError(
-                    f"FHIR_SERVER_AUTH_MODE={mode} needs FHIR_MCP_AUTH_MODE=resource_server: "
-                    "it sends the caller's MCP access token back to the IdP that issued it."
-                )
-            if not self.server_token_resource:
-                raise ConfigurationError(
-                    f"FHIR_SERVER_TOKEN_RESOURCE is required when FHIR_SERVER_AUTH_MODE={mode}: "
-                    "the FHIR API to get the user's token for."
-                )
-        if mode in ("token_exchange", "token_vault", "user_smart_login") and not self.server_client_id:
-            raise ConfigurationError(
-                f"FHIR_SERVER_CLIENT_ID is required when FHIR_SERVER_AUTH_MODE={mode}."
-            )
-        if mode in ("token_exchange", "token_vault") and not self.server_client_secret:
-            raise ConfigurationError(
-                f"FHIR_SERVER_CLIENT_SECRET is required when FHIR_SERVER_AUTH_MODE={mode}."
-            )
 
 
 class IDToken(BaseModel):

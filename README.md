@@ -465,20 +465,12 @@ The MCP server is an OAuth 2.1 resource server. Tokens are issued by your identi
 
 **FHIR Server Configuration (MCP Server ↔ FHIR Server):**
 - `FHIR_SERVER_BASE_URL`: The base URL of the FHIR server (e.g., `https://hapi.fhir.org/baseR4`). This is used to generate tool URIs and to route FHIR requests.
-- `FHIR_SERVER_AUTH_MODE`: How the server authenticates to the FHIR server. The MCP client's token is never forwarded to the FHIR server.
-    - `none` (default): no credential, e.g. a local or open FHIR server.
-    - `token_exchange`: the server exchanges the caller's MCP token (RFC 8693) at the same IdP for a token audienced to the FHIR API (`FHIR_SERVER_TOKEN_RESOURCE`), authenticating with `FHIR_SERVER_CLIENT_ID` / `FHIR_SERVER_CLIENT_SECRET`. Use it when the same IdP protects both the MCP server and the FHIR server.
-    - `user_smart_login`: each user signs in to the FHIR server (SMART App Launch) through a link the server sends. See [Authorization](#authorization).
-- `FHIR_SERVER_CLIENT_ID` / `FHIR_SERVER_CLIENT_SECRET`: The server's client at the IdP (`token_exchange`) or at the FHIR server (`user_smart_login`).
-- `FHIR_SERVER_SCOPES`: Scopes requested at the FHIR server sign-in (`user_smart_login`); must include `openid fhirUser`.
-- `FHIR_SERVER_TOKEN_RESOURCE`: The FHIR API's audience (`token_exchange`).
+- `FHIR_SERVER_CLIENT_ID` / `FHIR_SERVER_CLIENT_SECRET`: The FHIR server's user-facing app (for example an Epic app) that users sign in with when they link an agent. Leave the client ID empty for a FHIR server that needs no credential. Leave the secret empty for a public app. See [Linking agents](#linking-agents).
+- `FHIR_SERVER_SCOPES`: Scopes requested at the FHIR server sign-in; must include `openid fhirUser`.
 - `FHIR_SERVER_AUTHORIZE_URL` / `FHIR_SERVER_TOKEN_URL`: Override the endpoints from `<FHIR_SERVER_BASE_URL>/.well-known/smart-configuration`.
 - `FHIR_SERVER_CA_CERT`: Extra CA certificate for the FHIR server and its token endpoints.
 
-For local development without any sign-in, set `FHIR_MCP_AUTH_MODE=disabled` and `FHIR_SERVER_AUTH_MODE=none`.
-
-> [!IMPORTANT]
-> `FHIR_SERVER_DISABLE_AUTHORIZATION` has been removed. The server refuses to start while it is set; use `FHIR_MCP_AUTH_MODE` and `FHIR_SERVER_AUTH_MODE` instead.
+For local development without any sign-in, set `FHIR_MCP_AUTH_MODE=disabled` and leave `FHIR_SERVER_CLIENT_ID` empty.
 
 ### Authorization
 
@@ -495,61 +487,53 @@ To set up an IdP:
 - Register each MCP client (MCP Inspector, Claude, VS Code) with its redirect URI, or enable Client ID Metadata Documents or Dynamic Client Registration if your IdP supports them.
 - To let `get_user` find the signed-in user's FHIR record, add a `fhirUser` claim (e.g. `Patient/123` or `Practitioner/456`) to the access token.
 
-#### Each user connects their own Epic account (WSO2 Identity Server federated to Epic + `user_smart_login`)
+#### Linking agents
 
-Users exist only in Epic. WSO2 Identity Server signs them in through Epic (Epic added as a federated connection, just-in-time provisioning off) and issues the MCP token, which carries the Epic user's `fhirUser`.
+An agent is an MCP client that acts on its own, for example one Claude Code instance. Register it at your IdP with its own credentials (in ThunderID, as an Agent, with a client secret or a private key JWT) and give it the read, write and delete scopes it may ever use through roles. It calls the MCP server with a client credentials token, which names only the agent.
 
-- **WSO2 Identity Server** decides who may use the MCP server and issues the MCP token. The MCP client keeps it; the server checks it on every request and never stores it.
-- **Epic** decides who may see the health records. The first time a tool needs data, the server sends the user a link (URL-mode elicitation; an `InputRequiredResult` on 2026-07-28 clients). They sign in to Epic, and Epic gives the server their own FHIR token. The server keeps it under the MCP client's ID and the user's `sub`; it never reaches the client. By default that store is in memory and is lost on restart (see **Token storage** below).
+The user the agent acts for links it once:
 
-The Epic sign-in at the link must name the same person as the MCP token: the `fhirUser` claim of Epic's ID token, or else its `patient`, must match the MCP token's `fhirUser`, otherwise the connection is refused with a plain 403. A short-lived cookie also ties the Epic sign-in to the browser that opened the link. Users sign in at Epic twice (once through WSO2 Identity Server, once at the link), because Epic ends its session after each sign-in.
+1. The first time a tool needs the FHIR server, the server sends a link (URL-mode elicitation; an `InputRequiredResult` on 2026-07-28 clients).
+2. The link opens the server's consent page. The user chooses which tools the agent may use. Only tools within the agent's token scopes are offered; `get_capabilities` is always allowed, as it reads only the server's metadata.
+3. The user signs in at the FHIR server (for example Epic) and accepts its consent screen.
+4. The server keeps the user's FHIR tokens and the chosen tools in the agent's session. They never reach the agent. Later calls use them, refreshing the FHIR token when needed.
 
-This is not token exchange: Epic does not accept tokens from WSO2 Identity Server, so the server links the two sign-ins instead.
+Each agent acts for one user. A tool the user did not allow gets the link again, so the user can add it. Changing the tools needs the same FHIR account to sign in again, so neither the agent nor anyone else can widen its access or attach another account. A short-lived cookie ties the FHIR sign-in to the browser that opened the link. If the MCP token does carry a `fhirUser` claim (a user's own token), the FHIR sign-in must name the same person.
 
-Setup in WSO2 Identity Server (verified with 7.3):
-1. **Connections → New Connection**: Epic as an OpenID Connect connection, using a separate Epic app whose redirect URI is `https://<IS host>/commonauth`, with scopes `openid fhirUser` plus a FHIR read scope and the `aud` parameter set to the FHIR base URL. Map Epic's `fhirUser` claim and keep just-in-time provisioning off.
-2. **Resources → API Resources → New API Resource**: identifier `FHIR_MCP_RESOURCE_URL` (e.g. `http://localhost:8000/mcp`), scopes `fhir-read`, `fhir-write`, `fhir-delete`, and **Requires authorization** unticked.
-3. **Applications → New Application → MCP Client Application**: one per MCP client (public client, its redirect URI), signing in with the Epic connection, with `fhirUser` added to the access token's claims.
-4. Authorize the API resource on that application with the **No Authorization** policy, through the API: `POST /api/server/v1/applications/<app ID>/authorized-apis` with `{"id": "<API resource ID>", "policyIdentifier": "NO POLICY", "scopes": ["fhir-read", "fhir-write", "fhir-delete"]}`.
-5. **Token audience**: WSO2 Identity Server 7.3 ignores the `resource` parameter. Fetch `GET /api/server/v1/applications/<app ID>/inbound-protocols/oidc`, add `FHIR_MCP_RESOURCE_URL` to `idToken.audience`, and `PUT` the result back.
-6. Keep **Skip login consent** off so users see which scopes they grant.
+Users see and revoke their linked agents at `<server URL>/connect/agents`, after signing in at the FHIR server.
 
-In Epic on FHIR, register a patient-facing R4 app for the MCP server with redirect URI `<server URL>/connect/fhir/callback`, the FHIR APIs your tools need, and refresh tokens enabled (without them users reconnect when the token expires). Make it a confidential client with a sandbox secret (**Generate Secret**, then **Store Hash**, then save) and set `FHIR_SERVER_CLIENT_SECRET`. Leave **Can Register Dynamic Clients** off.
+Agent sessions are kept in the server's memory: nothing is written to disk, a restart forgets every session (users link their agents again), and server replicas do not share them.
+
+In Epic on FHIR, register a patient-facing R4 app with redirect URI `<server URL>/connect/fhir/callback`, the FHIR APIs your tools need, and refresh tokens enabled (without them users link again when the token expires). Make it a confidential client with a sandbox secret (**Generate Secret**, then **Store Hash**, then save) and set `FHIR_SERVER_CLIENT_SECRET`. Leave **Can Register Dynamic Clients** off.
 
 ```env
-FHIR_MCP_IDP_ISSUER="https://localhost:9443/oauth2/token"
+FHIR_MCP_IDP_ISSUER="https://localhost:8090"
 FHIR_MCP_RESOURCE_URL="http://localhost:8000/mcp"
-FHIR_MCP_IDP_CA_CERT="./wso2is.pem"
+FHIR_MCP_IDP_CA_CERT="./thunderid.cert"
 
 FHIR_SERVER_BASE_URL="https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4"
-FHIR_SERVER_AUTH_MODE="user_smart_login"
 FHIR_SERVER_CLIENT_ID="<Epic client ID>"
 FHIR_SERVER_CLIENT_SECRET="<Epic client secret>"
 FHIR_SERVER_SCOPES="openid fhirUser patient/Patient.read patient/Observation.read"
 ```
 
-#### One identity provider for both the MCP server and the FHIR server (`token_exchange`)
+#### Connecting an agent
 
-When the FHIR server (or a gateway in front of it) trusts the same IdP that issues MCP tokens, the server exchanges the caller's MCP token at that IdP (RFC 8693) for a token audienced to the FHIR API. The FHIR server sees the real user, and the IdP caps the exchanged token's scope to what the MCP token was granted. Exchanged tokens are cached per user until shortly before they expire.
+The agent gets its own token with client credentials and gets a new one when it expires (the server answers 401). How depends on the client; [examples/agents](examples/agents) has both of these. Put the agent's settings in `~/.fhir-agent/agent.json`, outside any repository, starting from [agent.example.json](examples/agents/agent.example.json).
 
-```env
-FHIR_MCP_IDP_ISSUER="https://localhost:9443/oauth2/token"
-FHIR_SERVER_BASE_URL="<FHIR API URL>"
-FHIR_SERVER_AUTH_MODE="token_exchange"
-FHIR_SERVER_CLIENT_ID="<MCP server's client at the IdP, allowed the token exchange grant>"
-FHIR_SERVER_CLIENT_SECRET="<its secret>"
-FHIR_SERVER_TOKEN_RESOURCE="<FHIR API audience>"
-```
+- **An agent on the MCP Python SDK**: the SDK's `ClientCredentialsOAuthProvider` (or `PrivateKeyJWTOAuthProvider`, for a key instead of a secret) discovers the IdP from the server's metadata and renews the token itself. See [fhir_agent.py](examples/agents/fhir_agent.py):
 
-#### Token storage
+  ```bash
+  python examples/agents/fhir_agent.py
+  ```
 
-Users' FHIR tokens, exchanged tokens (`token_exchange`), connect links and pending sign-ins are kept in a token store. The default keeps them in the server's memory: nothing is written to disk, and a restart forgets every connection, so users connect again. To keep connections across restarts or share them between replicas, plug in your own store (Redis, a database, a token vault) without changing the server:
+- **Claude Code**: its MCP OAuth signs a user in through the browser and has no client credentials grant, so a `headersHelper` gets the token instead. Claude Code runs it on every connection and again after a 401. See [token_helper.py](examples/agents/token_helper.py), then add the server for your user:
 
-```env
-FHIR_MCP_TOKEN_STORE="my_package.stores:create_store"
-```
+  ```bash
+  claude mcp add-json -s user fhir-agent '{"type":"http","url":"http://localhost:8000/mcp","headersHelper":"python /absolute/path/to/examples/agents/token_helper.py"}'
+  ```
 
-`create_store(configs)` receives the server's settings and returns an object with four async methods: `get(key)`, `put(key, value, ttl_seconds)`, `pop(key)` and `delete(key)`. Values are JSON-compatible. The store must expire entries after `ttl_seconds`, make `pop` atomic (read and delete in one step, because links and sign-in states are single-use), and encrypt values at rest, because they include FHIR access and refresh tokens. Read the store's own settings, such as a Redis URL, from the environment. See `src/fhir_mcp_server/token_store.py`.
+The first tool call answers with the consent link. VS Code and Claude Desktop sign users in through the browser only, so they cannot act as agents.
 
 ## Tools
 

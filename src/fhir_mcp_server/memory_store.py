@@ -16,8 +16,7 @@
 
 """A small in-memory key-value store with expiry.
 
-Used for small per-process caches, and behind the default token store
-(see fhir_mcp_server.token_store, which can be replaced through configuration).
+Used behind the agent session map (fhir_mcp_server.agent_sessions).
 Everything is lost on restart, and replicas do not share it.
 """
 

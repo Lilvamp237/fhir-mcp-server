@@ -6,22 +6,26 @@ This directory contains comprehensive test cases for the FHIR MCP server, includ
 
 ```
 tests/
-├── __init__.py
-├── unit/                           # Unit tests
-│   ├── __init__.py
-│   ├── test_utils.py              # Tests for utils module (21 tests)
-│   └── oauth/                      # OAuth-related tests
-│       ├── __init__.py
-│       ├── test_types.py          # Tests for OAuth data types (34 tests)
-│       ├── test_client_provider.py # Tests for OAuth client provider (30 tests)
-│       └── test_common.py         # Tests for OAuth common functions (33 tests)
-└── integration/                    # Integration tests
-│   ├── __init__.py
-│   └── test_integration.py        # Integration tests (5 tests)
-└── e2e/                            # End-to-end tests
-    ├── __init__.py
+├── unit/                             # Unit tests: single modules, no servers
+│   ├── test_utils.py                 # FHIR client and helper functions
+│   ├── test_backend_auth.py          # FHIR TLS and client authentication helpers
+│   ├── test_call_fhir.py             # 401 retry and 401/403 outcomes
+│   ├── field_filter/                 # FHIRPath response filtering
+│   └── oauth/test_types.py           # Settings and startup validation
+├── integration/                      # The server over real HTTP, against local stubs (offline)
+│   ├── conftest.py                   # Builds and serves the server as main() does
+│   ├── mcp_client.py                 # One MCP client API for both protocol versions
+│   ├── stubs/                        # In-process FHIR server, IdP and SMART (Epic) sign-in
+│   ├── snapshots/tools.json          # Expected tool schemas
+│   ├── test_integration.py           # Settings and token verifier wiring
+│   ├── test_authorization.py         # MCP login: 401, protected resource metadata, scopes
+│   ├── test_agent_link.py            # Agent linking: consent page, FHIR sign-in, allowed tools, revoke
+│   ├── test_protocol_eras.py         # 2026-07-28 and earlier protocol versions
+│   ├── test_tool_behaviour.py        # What each tool sends to the FHIR server
+│   └── test_tool_schemas.py          # Tool schemas against the snapshot
+└── e2e/                              # End-to-end tests against a live FHIR server
     ├── conftest.py
-    └── test_tools.py              # E2E tests for tool flows
+    └── test_tools.py
 ```
 
 ## Running Tests
@@ -49,59 +53,11 @@ PYTHONPATH=src python -m pytest tests/integration/ -v
 PYTHONPATH=src python -m pytest tests/unit/test_utils.py -v
 ```
 
-## Test Coverage
-
-The test suite achieves the following coverage:
-
-- **utils.py**: 100% coverage (41/41 statements)
-- **oauth/types.py**: 99% coverage (79/80 statements)
-- **oauth/common.py**: 100% coverage (62/62 statements)
-- **oauth/client_provider.py**: 99% coverage (111/112 statements)
-- **Overall coverage**: 53% (335/635 statements)
-
-*Note: The server.py module is not tested as it contains the main application logic that would require a full server setup. The OAuth server provider is partially tested due to its complexity.*
-
 ## Test Categories
 
-### Unit Tests (118 tests)
-
-#### Utils Module Tests (21 tests)
-- Tests for FHIR client creation with various configurations
-- Bundle entry extraction and processing
-- Resource trimming functionality
-- Operation outcome error generation
-- Capability statement discovery
-- Default headers generation
-
-#### OAuth Types Tests (34 tests)
-- Configuration classes validation
-- OAuth metadata handling
-- Token management and scope validation
-- Authorization code handling
-- URL generation and validation
-
-#### OAuth Client Provider Tests (30 tests)
-- OAuth flow execution with PKCE
-- Token validation and refresh
-- HTTP request mocking
-- Error handling and edge cases
-- Callback handling
-- Scope validation
-
-#### OAuth Common Functions Tests (33 tests)
-- OAuth metadata discovery
-- Token expiration checking
-- Endpoint URL extraction
-- Code verifier/challenge generation
-- Token flow execution
-- Authentication response handling
-
-### Integration Tests (5 tests)
-- Server configuration integration
-- Provider initialization
-- OAuth flow coordination
-- URL generation consistency
-- Cross-component communication
+- **Unit tests** check one module at a time.
+- **Integration tests** start the MCP server over Streamable HTTP, as `main()` does, with local stubs for the FHIR server, the identity provider and the FHIR server's sign-in, so they need no network. They cover the MCP login, agent linking and consent, both protocol versions, and every tool. After an intended change to a tool's schema, update the snapshot with `UPDATE_TOOL_SNAPSHOT=1 pytest tests/integration/test_tool_schemas.py`.
+- **End-to-end tests** run the server against a live public FHIR server.
 
 ## Test Features
 

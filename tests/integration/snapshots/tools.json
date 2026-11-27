@@ -1,0 +1,516 @@
+[
+  {
+    "description": "Creates a new FHIR resource on the server (FHIR `create` interaction: POST [base]/{type}). Use it to add a record that does not exist yet, such as a new Patient, Observation or Appointment. Do not use it to change an existing resource; use `update` for that. The server assigns a new id on every call, so repeating a call creates duplicates; use `search` first if the record may already exist. On success it returns the resource as stored, including the server-assigned `id` and `meta`. On failure it returns OperationOutcome issues whose `diagnostics` explain what to fix, such as a missing required element or an invalid code.",
+    "inputSchema": {
+      "properties": {
+        "operation": {
+          "default": "",
+          "description": "The name of a custom FHIR operation or extended query defined for the resourceMust match one of the operation names returned by `get_capabilities`.",
+          "examples": [
+            "$evaluate"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "description": "The JSON body of the new resource. Include every element the resource's profile marks as required, or the server rejects the request. Set `resourceType` to the same value as `type`; if omitted, it defaults to `type`. Leave out `id` and `meta`, which the server assigns.",
+          "examples": [
+            {
+              "birthDate": "1980-04-12",
+              "gender": "male",
+              "name": [
+                {
+                  "family": "Smith",
+                  "given": [
+                    "John"
+                  ]
+                }
+              ],
+              "resourceType": "Patient"
+            }
+          ],
+          "title": "Payload",
+          "type": "object"
+        },
+        "searchParam": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "default": {},
+          "description": "A mapping of FHIR search parameter names to their desired values. These parameters refine queries for operation-specific query qualifiers. Only parameters exposed by `get_capabilities` for that resource type are valid.",
+          "examples": [
+            "{\"address-city\": \"Boston\", \"address-state\": [\"NY\"]}"
+          ],
+          "title": "Searchparam",
+          "type": "object"
+        },
+        "type": {
+          "description": "The FHIR resource type name. Must exactly match one of the resource types supported by the server.",
+          "examples": [
+            "Device",
+            "CarePlan",
+            "Goal"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "title": "createArguments",
+      "type": "object"
+    },
+    "name": "create",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "additionalProperties": true,
+          "description": "A dictionary containing the newly created FHIR resource, including server-assigned fields (id, meta.versionId, meta.lastUpdated, and any server-added extensions). Reflects exactly what was persisted.",
+          "title": "Result",
+          "type": "object"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "createOutput",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Execute a FHIR `delete` interaction on a specific resource instance. Use this tool when you need to remove a single resource identified by its logical ID or optionally filtered by search parameters. The optional `id` parameter must match an existing resource instance when present. If you include `searchParam`, the server will perform a conditional delete, deleting the resource only if it matches the given criteria. If you supply `operation`, it will execute the named FHIR operation (e.g., `$expunge`) on the resource. This tool returns a FHIR `OperationOutcome` describing success or failure of the deletion.",
+    "inputSchema": {
+      "properties": {
+        "id": {
+          "default": "",
+          "description": "The logical ID of a specific FHIR resource instance.",
+          "title": "Id",
+          "type": "string"
+        },
+        "operation": {
+          "default": "",
+          "description": "The name of a custom FHIR operation or extended query defined for the resourceMust match one of the operation names returned by `get_capabilities`.",
+          "examples": [
+            "$expand"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "searchParam": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "default": {},
+          "description": "A mapping of FHIR search parameter names to their desired values. These parameters refine queries for operation-specific query qualifiers. Only parameters exposed by `get_capabilities` for that resource type are valid. ",
+          "examples": [
+            "{\"category\": \"laboratory\", \"status\": [\"active\"]}"
+          ],
+          "title": "Searchparam",
+          "type": "object"
+        },
+        "type": {
+          "description": "The FHIR resource type name. Must exactly match one of the resource types supported by the server.",
+          "examples": [
+            "ServiceRequest",
+            "Appointment",
+            "HealthcareService"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "deleteArguments",
+      "type": "object"
+    },
+    "name": "delete",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "additionalProperties": true,
+          "description": "A dictionary containing the confirmation of deletion or details on why deletion failed.",
+          "title": "Result",
+          "type": "object"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "deleteOutput",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Retrieves metadata about a specified FHIR resource type, including its supported search parameters and custom operations. This tool MUST always be invoked before performing any resource operation (such as search, read, create, update, or delete) to discover the valid searchParams and operations permitted for that resource type. Do not use this tool to fetch actual resources.",
+    "inputSchema": {
+      "properties": {
+        "type": {
+          "description": "The FHIR resource type name. Must exactly match one of the core or profile-defined resource types as per the FHIR specification.",
+          "examples": [
+            "Patient",
+            "Observation",
+            "Encounter"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "get_capabilitiesArguments",
+      "type": "object"
+    },
+    "name": "get_capabilities",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "additionalProperties": true,
+          "description": "A dictionary containing: 'type': The requested resource type (if supported by the system) or empty. 'searchParam': A mapping of FHIR search parameter names to their descriptions. Each key is a parameter name (e.g., family, _id, _lastUpdated), and each value is a string describing the parameter's meaning and usage constraints. 'operation': A mapping of custom FHIR operation names to their descriptions. Each key is an operation name (e.g., $validate), and each value is a string explaining the operation's purpose and usage. 'interaction': A list of supported interactions for the resource type (e.g., read, search-type, create). 'searchInclude': A list of supported _include parameters for the resource type, indicating which related resources can be included. 'searchRevInclude': A list of supported _revinclude parameters for the resource type, indicating which reverse-included resources can be included.",
+          "title": "Result",
+          "type": "object"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "get_capabilitiesOutput",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Retrieves the authenticated user's FHIR profile. Use this tool when you need to access the current user's demographic and contact details.",
+    "inputSchema": {
+      "properties": {},
+      "title": "get_userArguments",
+      "type": "object"
+    },
+    "name": "get_user",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "anyOf": [
+            {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            }
+          ],
+          "description": "A dictionary containing the authenticated user's demographic information such as 'id', 'name', and 'birthDate'.",
+          "title": "Result"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "get_userOutput",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Performs a FHIR `read` interaction to retrieve a single resource instance by its type and resource ID, optionally refining the response with search parameters or custom operations. Use it when you know the exact resource ID and require that one resource; do not use it for bulk queries. If additional query-level parameters or operations are needed (e.g., _elements or $validate), include them in searchParam or operation. Optionally specify fields to filter the response to only the data your task needs (e.g., Patient.birthDate, Observation.valueQuantity).",
+    "inputSchema": {
+      "properties": {
+        "id": {
+          "description": "The logical ID of a specific FHIR resource instance.",
+          "title": "Id",
+          "type": "string"
+        },
+        "operation": {
+          "default": "",
+          "description": "The name of a custom FHIR operation or extended query defined for the resource must match one of the operation names returned by `get_capabilities`.",
+          "examples": [
+            "$everything"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "response_filter_fhirpaths": {
+          "default": [],
+          "description": "Specify FHIRPath expressions to filter the response to only the data you need. Omitting returns the full resource. Bundle.* expressions supported with $everything.",
+          "examples": [
+            [
+              "Patient.name",
+              "Patient.birthDate",
+              "Observation.valueQuantity"
+            ]
+          ],
+          "items": {
+            "type": "string"
+          },
+          "title": "Response Filter Fhirpaths",
+          "type": "array"
+        },
+        "searchParam": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "default": {},
+          "description": "A mapping of FHIR search parameter names to their desired values. These parameters refine queries for operation-specific query qualifiers. Only parameters exposed by `get_capabilities` for that resource type are valid.",
+          "examples": [
+            "{\"device-name\": \"glucometer\", \"identifier\": [\"12345\"]}"
+          ],
+          "title": "Searchparam",
+          "type": "object"
+        },
+        "type": {
+          "description": "The FHIR resource type name. Must exactly match one of the resource types supported by the server.",
+          "examples": [
+            "DiagnosticReport",
+            "AllergyIntolerance",
+            "Immunization"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "id"
+      ],
+      "title": "readArguments",
+      "type": "object"
+    },
+    "name": "read",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "additionalProperties": true,
+          "description": "A dictionary containing the single FHIR resource instance of the requested type and id.",
+          "title": "Result",
+          "type": "object"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "readOutput",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Executes a standard FHIR `search` interaction on a given resource type, returning a bundle or list of matching resources. Use this when you need to query for multiple resources based on one or more search-parameters. Do not use this tool for create, update, or delete operations, and be aware that large result sets may be paginated by the FHIR server. Optionally specify fields to filter the response to only the data your task needs (e.g., Patient.birthDate, Observation.valueQuantity).",
+    "inputSchema": {
+      "properties": {
+        "response_filter_fhirpaths": {
+          "default": [],
+          "description": "Specify FHIRPath expressions to filter the response to only the data you need. Omitting returns the full resource.",
+          "examples": [
+            [
+              "Condition.code",
+              "Condition.clinicalStatus",
+              "Bundle.link.where(relation='next').url"
+            ]
+          ],
+          "items": {
+            "type": "string"
+          },
+          "title": "Response Filter Fhirpaths",
+          "type": "array"
+        },
+        "searchParam": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "description": "A mapping of FHIR search parameter names to their values. Only include parameters supported for the resource type, as listed by `get_capabilities`.",
+          "examples": [
+            "{\"family\": \"Smith\"}",
+            "{\"date\": [\"ge1970-01-01\", \"lt2000-01-01\"]}"
+          ],
+          "title": "Searchparam",
+          "type": "object"
+        },
+        "type": {
+          "description": "The FHIR resource type name. Must exactly match one of the resource types supported by the server",
+          "examples": [
+            "MedicationRequest",
+            "Condition",
+            "Procedure"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "searchParam"
+      ],
+      "title": "searchArguments",
+      "type": "object"
+    },
+    "name": "search",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "anyOf": [
+            {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            }
+          ],
+          "description": "A dictionary containing the full FHIR resource instance matching the search criteria.",
+          "title": "Result"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "searchOutput",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Replaces the full content of an existing FHIR resource (FHIR `update` interaction: PUT [base]/{type}/{id}). Use it to correct or complete a record whose logical id you already know. Elements left out of the payload are removed from the stored resource, not kept, so first get the current version with `read`, change what you need, and send the whole resource back. Do not use it to add new records; use `create` for that. On success it returns the resource as stored, with an updated `meta.versionId` and `meta.lastUpdated`. On failure it returns OperationOutcome issues whose `diagnostics` explain what to fix.",
+    "inputSchema": {
+      "properties": {
+        "id": {
+          "description": "The logical ID of a specific FHIR resource instance.",
+          "title": "Id",
+          "type": "string"
+        },
+        "operation": {
+          "default": "",
+          "description": "The name of a custom FHIR operation or extended query defined for the resourceMust match one of the operation names returned by `get_capabilities`.",
+          "examples": [
+            "$lastn"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "description": "The complete new content of the resource. It replaces the stored version entirely, so include every required element and all existing data you want to keep. Set `resourceType` to the same value as `type`; if omitted, it defaults to `type`. The body `id` is always set to the `id` argument, overriding any value given here.",
+          "examples": [
+            {
+              "active": true,
+              "id": "org-1001",
+              "name": "Boston General Hospital",
+              "resourceType": "Organization",
+              "telecom": [
+                {
+                  "system": "phone",
+                  "value": "+1-617-555-0100"
+                }
+              ]
+            }
+          ],
+          "title": "Payload",
+          "type": "object"
+        },
+        "searchParam": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "default": {},
+          "description": "A mapping of FHIR search parameter names to their desired values. These parameters refine queries for operation-specific query qualifiers. Only parameters exposed by `get_capabilities` for that resource type are valid. ",
+          "examples": [
+            "{\"patient\":\"Patient/54321\",\"relationship\":[\"father\"]}"
+          ],
+          "title": "Searchparam",
+          "type": "object"
+        },
+        "type": {
+          "description": "The FHIR resource type name. Must exactly match one of the resource types supported by the server.",
+          "examples": [
+            "Location",
+            "Organization",
+            "Coverage"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "payload"
+      ],
+      "title": "updateArguments",
+      "type": "object"
+    },
+    "name": "update",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "additionalProperties": true,
+          "description": "A dictionary containing the updated FHIR resource",
+          "title": "Result",
+          "type": "object"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "updateOutput",
+      "type": "object"
+    }
+  }
+]
