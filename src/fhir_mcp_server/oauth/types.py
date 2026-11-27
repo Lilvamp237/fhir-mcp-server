@@ -71,10 +71,13 @@ class ServerConfigs(BaseSettings):
     # token_exchange: exchange the caller's MCP token at the same IdP (RFC 8693)
     # user_smart_login: each user signs in at the FHIR server (SMART App Launch); the IdP
     #   federates to the FHIR server, and the FHIR sign-in must match the MCP token's fhirUser
-    server_auth_mode: Literal["none", "token_exchange", "user_smart_login"] = "none"
+    # token_vault: the IdP keeps the user's FHIR token (e.g. from a federated sign-in) and
+    #   releases it to the MCP server for the caller's MCP token
+    server_auth_mode: Literal["none", "token_exchange", "user_smart_login", "token_vault"] = "none"
     server_authorize_url: str | None = None  # user_smart_login; defaults to the FHIR server's SMART configuration
     server_token_url: str | None = None
-    server_token_resource: str | None = None  # token_exchange: the FHIR API's audience
+    server_token_resource: str | None = None  # token_exchange: the FHIR API's audience; token_vault: its resource
+    server_vault_grant_type: str = "urn:thunderid:params:oauth:grant-type:upstream-token"
     server_client_id: str = ""
     server_client_secret: str = ""
     server_scopes: str = ""
@@ -142,24 +145,24 @@ class ServerConfigs(BaseSettings):
                     "FHIR_SERVER_AUTH_MODE=user_smart_login needs `openid fhirUser` in FHIR_SERVER_SCOPES, "
                     "so the FHIR server says who signed in."
                 )
-        if mode == "token_exchange":
+        if mode in ("token_exchange", "token_vault"):
             if self.mcp_auth_mode != "resource_server":
                 raise ConfigurationError(
-                    "FHIR_SERVER_AUTH_MODE=token_exchange needs FHIR_MCP_AUTH_MODE=resource_server: "
-                    "it exchanges the caller's MCP access token at the IdP that issued it."
+                    f"FHIR_SERVER_AUTH_MODE={mode} needs FHIR_MCP_AUTH_MODE=resource_server: "
+                    "it sends the caller's MCP access token back to the IdP that issued it."
                 )
             if not self.server_token_resource:
                 raise ConfigurationError(
-                    "FHIR_SERVER_TOKEN_RESOURCE is required when FHIR_SERVER_AUTH_MODE=token_exchange: "
-                    "the FHIR API's audience to exchange the MCP token for."
+                    f"FHIR_SERVER_TOKEN_RESOURCE is required when FHIR_SERVER_AUTH_MODE={mode}: "
+                    "the FHIR API to get the user's token for."
                 )
-        if mode in ("token_exchange", "user_smart_login") and not self.server_client_id:
+        if mode in ("token_exchange", "token_vault", "user_smart_login") and not self.server_client_id:
             raise ConfigurationError(
                 f"FHIR_SERVER_CLIENT_ID is required when FHIR_SERVER_AUTH_MODE={mode}."
             )
-        if mode == "token_exchange" and not self.server_client_secret:
+        if mode in ("token_exchange", "token_vault") and not self.server_client_secret:
             raise ConfigurationError(
-                "FHIR_SERVER_CLIENT_SECRET is required when FHIR_SERVER_AUTH_MODE=token_exchange."
+                f"FHIR_SERVER_CLIENT_SECRET is required when FHIR_SERVER_AUTH_MODE={mode}."
             )
 
 

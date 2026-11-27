@@ -205,6 +205,50 @@ class TestTokenExchange:
         assert "s3cret" not in str(error.value)
 
 
+class TestTokenVault:
+    """FHIR_SERVER_AUTH_MODE=token_vault: the IdP's vault releases the user's stored FHIR token."""
+
+    def _configs(self, idp: "IdpStub", **values: Any) -> ServerConfigs:
+        return make_configs(
+            mcp_idp_issuer=idp.base_url,
+            server_auth_mode="token_vault",
+            server_client_id="fhir-mcp",
+            server_client_secret="s3cret",
+            server_token_resource="https://fhir.example.org/R4",
+            **values,
+        )
+
+    async def test_asks_the_vault_with_its_own_grant(self, idp):
+        token = await TokenExchangeProvider(self._configs(idp)).exchange("mcp-access-token", "user-1")
+
+        assert token == "exchanged-token-1"
+        form, authorization = idp.requests[0]
+        assert form == {
+            "grant_type": "urn:thunderid:params:oauth:grant-type:upstream-token",
+            "subject_token": "mcp-access-token",
+            "resource": "https://fhir.example.org/R4",
+        }
+        assert authorization == "Basic " + base64.b64encode(b"fhir-mcp:s3cret").decode()
+
+    async def test_grant_type_is_configurable(self, idp):
+        configs = self._configs(idp, server_vault_grant_type="urn:example:upstream-token")
+        await TokenExchangeProvider(configs).exchange("mcp-access-token", "user-1")
+
+        assert idp.requests[0][0]["grant_type"] == "urn:example:upstream-token"
+
+    def test_needs_resource_client_and_mcp_login(self):
+        base = {"server_auth_mode": "token_vault", "mcp_idp_issuer": "https://idp.example.com"}
+        with pytest.raises(ConfigurationError, match="FHIR_SERVER_TOKEN_RESOURCE"):
+            make_configs(**base, server_client_id="a", server_client_secret="b").validate_for_startup()
+        with pytest.raises(ConfigurationError, match="FHIR_SERVER_CLIENT_SECRET"):
+            make_configs(**base, server_client_id="a", server_token_resource="r").validate_for_startup()
+        with pytest.raises(ConfigurationError, match="FHIR_MCP_AUTH_MODE=resource_server"):
+            make_configs(
+                **base, mcp_auth_mode="disabled", server_client_id="a", server_client_secret="b",
+                server_token_resource="r",
+            ).validate_for_startup()
+
+
 class TestFhirTls:
     """FHIR_SERVER_CA_CERT: a FHIR server or token endpoint with a self-signed certificate."""
 

@@ -97,16 +97,31 @@ class TokenExchangeProvider:
         """Exchanged tokens per user (FHIR_MCP_TOKEN_STORE), created on first use."""
         return create_token_store(self._configs)
 
+    async def forget(self, sub: str | None) -> None:
+        """Drop the user's cached token, e.g. after the FHIR server rejected it. The upstream
+        may have revoked it early, such as when the user signed in again and was issued a
+        new one; the next call then asks the IdP again."""
+        if sub:
+            await self._cache.delete(f"exchanged:{sub}")
+
     async def exchange(self, subject_token: str, sub: str | None) -> str:
         cache_key = f"exchanged:{sub}" if sub else None
         if cache_key and (cached := await self._cache.get(cache_key)) is not None:
             return cached
         endpoint = await self._token_endpoint()
-        form: Dict[str, str] = {
-            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
-            "subject_token": subject_token,
-            "subject_token_type": ACCESS_TOKEN_TYPE,
-        }
+        if self._configs.effective_server_auth_mode == "token_vault":
+            # The IdP's token vault releases the upstream token it keeps for this user. Its own
+            # extension grant: no token type parameters (it is not RFC 8693).
+            form: Dict[str, str] = {
+                "grant_type": self._configs.server_vault_grant_type,
+                "subject_token": subject_token,
+            }
+        else:
+            form = {
+                "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
+                "subject_token": subject_token,
+                "subject_token_type": ACCESS_TOKEN_TYPE,
+            }
         if self._configs.server_token_resource:
             form["resource"] = self._configs.server_token_resource
         if self._configs.server_scopes:
@@ -121,13 +136,13 @@ class TokenExchangeProvider:
             response = await client.post(endpoint, data=form, headers=headers)
         if response.status_code != 200:
             raise BackendAuthError(
-                f"The identity provider refused the token exchange (HTTP {response.status_code}): "
+                f"The identity provider refused the token request (HTTP {response.status_code}): "
                 f"{_error_summary(response)}"
             )
         payload: Dict[str, Any] = response.json()
         token = payload.get("access_token")
         if not token:
-            raise BackendAuthError("The identity provider's token exchange returned no access_token.")
+            raise BackendAuthError("The identity provider returned no access_token.")
         if cache_key:
             expires_in = float(payload.get("expires_in") or DEFAULT_EXPIRES_IN_SECONDS)
             margin = min(REFRESH_MARGIN_SECONDS, expires_in / 2)

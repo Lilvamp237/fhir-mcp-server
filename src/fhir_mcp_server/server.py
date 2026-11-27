@@ -38,9 +38,9 @@ from fhir_mcp_server.fhir_connect import FhirConnect
 from fhir_mcp_server.oauth import IDToken, ServerConfigs
 from fhir_mcp_server.oauth.types import ConfigurationError
 from fhirpy import AsyncFHIRClient
-from fhirpy.base.exceptions import OperationOutcome, ResourceNotFound
+from fhirpy.base.exceptions import AuthorizationError, ForbiddenError, OperationOutcome, ResourceNotFound
 from fhirpy.base.searchset import Raw
-from typing import Dict, Any, List
+from typing import Awaitable, Callable, Dict, Any, List, TypeVar
 from typing_extensions import Annotated
 from pydantic import AnyHttpUrl, Field
 from starlette.applications import Starlette
@@ -91,10 +91,10 @@ async def get_backend_access_token() -> str | None:
     The MCP access token is never forwarded to the FHIR server.
     """
     mode: str = configs.effective_server_auth_mode
-    if mode == "token_exchange":
+    if mode in ("token_exchange", "token_vault"):
         access_token: AccessToken | None = get_access_token()
         if access_token is None:
-            raise BackendAuthError("Token exchange requires a validated MCP access token.")
+            raise BackendAuthError(f"{mode} requires a validated MCP access token.")
         return await token_exchange_provider.exchange(access_token.token, access_token.subject)
     if mode == "user_smart_login":
         access_token: AccessToken | None = get_access_token()
@@ -135,6 +135,52 @@ async def get_async_fhir_client() -> AsyncFHIRClient:
     if access_token:
         client_kwargs["access_token"] = access_token
     return await create_async_fhir_client(**client_kwargs)
+
+
+T = TypeVar("T")
+
+FHIR_UNAUTHORIZED_MESSAGE = (
+    "The FHIR server did not accept the user's credential (HTTP 401). "
+    "The user may need to sign in again."
+)
+FHIR_FORBIDDEN_MESSAGE = (
+    "The FHIR server refused this request (HTTP 403). The user's access to the FHIR server "
+    "does not cover it, for example a scope the user was not granted or another patient's data."
+)
+
+
+async def forget_backend_token() -> bool:
+    """Drop the user's cached FHIR token in the modes that cache one. True if dropped."""
+    if configs.effective_server_auth_mode not in ("token_exchange", "token_vault"):
+        return False
+    access_token: AccessToken | None = get_access_token()
+    if access_token is None or not access_token.subject:
+        return False
+    await token_exchange_provider.forget(access_token.subject)
+    return True
+
+
+async def call_fhir(operation: Callable[[AsyncFHIRClient], Awaitable[T]]) -> T:
+    """Run a FHIR request with the backend credential.
+
+    If the FHIR server rejects a cached token (401), for example because the upstream revoked
+    it when the user signed in again, the token is dropped and the request retried once with a
+    fresh one. A refused request (401 or 403) becomes an OperationOutcome that says so.
+    """
+    try:
+        return await operation(await get_async_fhir_client())
+    except AuthorizationError:
+        if not await forget_backend_token():
+            raise OperationOutcome(FHIR_UNAUTHORIZED_MESSAGE, code="login") from None
+        logger.info("The FHIR server rejected the cached token; retrying once with a fresh one.")
+    except ForbiddenError:
+        raise OperationOutcome(FHIR_FORBIDDEN_MESSAGE, code="forbidden") from None
+    try:
+        return await operation(await get_async_fhir_client())
+    except AuthorizationError:
+        raise OperationOutcome(FHIR_UNAUTHORIZED_MESSAGE, code="login") from None
+    except ForbiddenError:
+        raise OperationOutcome(FHIR_FORBIDDEN_MESSAGE, code="forbidden") from None
 
 
 async def check_tool_scope(tool: str) -> Dict[str, Any] | None:
@@ -431,9 +477,8 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             if outcome := await validate_resource_type(type):
                 return outcome
 
-            client: AsyncFHIRClient = await get_async_fhir_client()
-            async_resources: list[Any] = (
-                await client.resources(type).search(Raw(**searchParam)).fetch_raw()
+            async_resources: list[Any] = await call_fhir(
+                lambda client: client.resources(type).search(Raw(**searchParam)).fetch_raw()
             )
             logger.debug("Async resources fetched: %s", async_resources)
             return filter_response_fields(async_resources, response_filter_fhirpaths)
@@ -531,9 +576,10 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             if outcome := await validate_inputs(type, id, operation):
                 return outcome
 
-            client: AsyncFHIRClient = await get_async_fhir_client()
-            bundle: dict = await client.resource(resource_type=type, id=id).execute(
-                operation=operation or "", method="GET", params=searchParam
+            bundle: dict = await call_fhir(
+                lambda client: client.resource(resource_type=type, id=id).execute(
+                    operation=operation or "", method="GET", params=searchParam
+                )
             )
 
             entries = await extract_bundle_resources(bundle=bundle)
@@ -652,11 +698,12 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             if outcome := await validate_inputs(type, operation=operation):
                 return outcome
 
-            client: AsyncFHIRClient = await get_async_fhir_client()
-            bundle: dict = await client.resource(resource_type=type).execute(
-                operation=operation or "",
-                data={"resourceType": type, **payload},
-                params=searchParam,
+            bundle: dict = await call_fhir(
+                lambda client: client.resource(resource_type=type).execute(
+                    operation=operation or "",
+                    data={"resourceType": type, **payload},
+                    params=searchParam,
+                )
             )
             return await extract_bundle_resources(bundle=bundle)
         except ValueError as ex:
@@ -764,12 +811,13 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             if outcome := await validate_inputs(type, id, operation):
                 return outcome
 
-            client: AsyncFHIRClient = await get_async_fhir_client()
-            bundle: dict = await client.resource(resource_type=type, id=id).execute(
-                operation=operation or "",
-                method="PUT",
-                data={"resourceType": type, **payload, "id": id},
-                params=searchParam,
+            bundle: dict = await call_fhir(
+                lambda client: client.resource(resource_type=type, id=id).execute(
+                    operation=operation or "",
+                    method="PUT",
+                    data={"resourceType": type, **payload, "id": id},
+                    params=searchParam,
+                )
             )
             return await extract_bundle_resources(bundle=bundle)
         except ValueError as ex:
@@ -863,9 +911,10 @@ def register_mcp_tools(mcp: MCPServer) -> None:
                 )
                 return await get_operation_outcome_required_error("id")
 
-            client: AsyncFHIRClient = await get_async_fhir_client()
-            bundle = await client.resource(resource_type=type, id=id).execute(
-                operation=operation or "", method="DELETE", params=searchParam
+            bundle = await call_fhir(
+                lambda client: client.resource(resource_type=type, id=id).execute(
+                    operation=operation or "", method="DELETE", params=searchParam
+                )
             )
             if isinstance(bundle, Dict):
                 return await extract_bundle_resources(bundle=bundle)
@@ -940,9 +989,10 @@ def register_mcp_tools(mcp: MCPServer) -> None:
             logger.debug(f"Fetching FHIR resource: {resource_type}/{resource_id}")
 
             # Fetch user's FHIR resource
-            client: AsyncFHIRClient = await get_async_fhir_client()
-            resource: Dict[str, Any] = await client.get(
-                resource_type_or_resource_or_ref=resource_type, id_or_ref=resource_id
+            resource: Dict[str, Any] = await call_fhir(
+                lambda client: client.get(
+                    resource_type_or_resource_or_ref=resource_type, id_or_ref=resource_id
+                )
             )
 
             # Build response with only available fields
